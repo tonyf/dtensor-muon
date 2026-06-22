@@ -1,23 +1,23 @@
 # Low-precision Muon optimizer with quantized optimizer states
+try:
+    import torchao  # noqa: F401  # ty: ignore[unresolved-import]
+except ImportError:
+    raise ImportError("Please install `torchao` package to use low-precision optimizers")
+
 import math
 
 import torch
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import _get_scalar_dtype
-from torchao.optim.subclass_4bit import OptimState4bit
-from torchao.optim.subclass_8bit import OptimState8bit
-from torchao.optim.subclass_fp8 import OptimStateFp8
+from torchao.optim.subclass_4bit import OptimState4bit  # ty: ignore[unresolved-import]
+from torchao.optim.subclass_8bit import OptimState8bit  # ty: ignore[unresolved-import]
+from torchao.optim.subclass_fp8 import OptimStateFp8  # ty: ignore[unresolved-import]
 
 from dtensor_muon.orthogonalize import OrthogonalizationStrategy
 from dtensor_muon.utils import to_local
 
 from .optim import Muon
-
-try:
-    import torchao  # noqa: F401
-except ImportError:
-    raise ImportError("Please install `torchao` package to use low-precision optimizers")
 
 
 class MuonLP(Muon):

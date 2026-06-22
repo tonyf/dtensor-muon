@@ -42,7 +42,9 @@ class Muon(torch.optim.Optimizer):
             wd: Default weight decay
             use_cautious_wd: Use cautious weight decay for Muon groups. When enabled,
                 weight decay is only applied when the update and parameter have the
-                same sign (i.e., when u * p > 0).
+                same sign (i.e., when u * p > 0). This is an addition to the original
+                Muon, which has no cautious variant; set to False for plain
+                (non-cautious) decoupled weight decay.
             momentum: Muon momentum
             nesterov: Use Nesterov momentum for Muon
             ns_steps: Number of orthogonalization steps for Muon
@@ -156,6 +158,7 @@ class Muon(torch.optim.Optimizer):
         }
 
     def _build_adam_group(self, group: dict):
+        algorithm = cast(str, group.get("algorithm", "adamw")).lower()
         return {
             "params": group["params"],
             "use_muon": False,
@@ -164,7 +167,9 @@ class Muon(torch.optim.Optimizer):
             "amsgrad": group.get("amsgrad", self.amsgrad),
             "betas": group.get("betas", self.adam_betas),
             "eps": group.get("eps", self.adam_eps),
-            "decoupled_weight_decay": group.get("decoupled_weight_decay", self.is_adamw),
+            "decoupled_weight_decay": group.get(
+                "decoupled_weight_decay", self.is_adamw and algorithm == "adamw"
+            ),
             "fused": group.get("fused", self.fused_adam),
             "maximize": group.get("maximize", self.maximize),
             "has_complex": any(torch.is_complex(p) for p in group["params"]),
@@ -181,7 +186,7 @@ class Muon(torch.optim.Optimizer):
                 group.setdefault("nesterov", True)
                 group.setdefault("flatten", True)
                 group.setdefault("use_cautious_wd", True)
-                group.setdefault("orthogonalization_strategy", "newton_schulz")
+                group.setdefault("orthogonalization_strategy", "polar_express")
                 if not torch.is_tensor(group["lr"]):
                     group["lr"] = torch.tensor(float(group["lr"]))
 
@@ -244,7 +249,7 @@ class Muon(torch.optim.Optimizer):
             if len(state) == 0:
                 state["step"] = torch.tensor(0.0, dtype=_get_scalar_dtype())
                 state["momentum_buffer"] = torch.zeros_like(
-                    grad, memory_format=torch.preserve_format
+                    grad, dtype=torch.float32, memory_format=torch.preserve_format
                 )
                 state["lr_ratio"] = torch.tensor(
                     math.sqrt(max(1.0, grad.shape[-2] / grad.shape[-1]))
@@ -335,7 +340,7 @@ class Muon(torch.optim.Optimizer):
             params, grads, momentum_buffers, lr_ratios, strict=True
         ):
             if maximize:
-                grad.neg_()
+                grad = -grad
 
             param_fp32 = param.to(torch.float32)
             grad_fp32 = grad.to(torch.float32)
@@ -355,7 +360,8 @@ class Muon(torch.optim.Optimizer):
             u = zeropower(grad_fp32, steps=ns_steps, strategy=orthogonalization_strategy)
             u = u.view_as(param_fp32)
 
-            # Apply weight decay
+            # Apply weight decay. Cautious WD (only where u * p > 0) is an addition
+            # to the original Muon; cautious_wd=False gives plain decoupled WD.
             if weight_decay != 0:
                 if cautious_wd:
                     u.addcmul_(param_fp32, (u * param_fp32 > 0), value=weight_decay)
@@ -419,6 +425,12 @@ class Muon(torch.optim.Optimizer):
             state_steps,
         )
 
+        lr = group["lr"]
+        weight_decay = group["wd"]
+        if not group["fused"]:
+            lr = float(lr) if torch.is_tensor(lr) else lr
+            weight_decay = float(weight_decay) if torch.is_tensor(weight_decay) else weight_decay
+
         self._adam_impl(
             params_with_grad,
             grads,
@@ -430,8 +442,8 @@ class Muon(torch.optim.Optimizer):
             has_complex=group["has_complex"],
             beta1=beta1,
             beta2=beta2,
-            lr=group["lr"],
-            weight_decay=group["wd"],
+            lr=lr,
+            weight_decay=weight_decay,
             eps=group["eps"],
             maximize=group["maximize"],
             foreach=not group["fused"],

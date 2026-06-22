@@ -16,7 +16,7 @@ from dtensor_muon.kernels.gram import gram_
 @torch.compile(fullgraph=True)
 def ns_loop(
     X: Annotated[Tensor, "B N M"],
-    steps: int,
+    steps: int = 5,
     *,
     a: float = 3.4445,
     b: float = -4.7750,
@@ -46,8 +46,10 @@ def ns_loop(
 
     for _ in range(steps):
         A = torch.matmul(X, X.transpose(-1, -2))
-        B = A.mul(b).add_(torch.matmul(A, A), alpha=c)
-        X = X.mul(a).add_(torch.matmul(B, X))
+        # Out-of-place accumulation: the in-place add_ form miscompiles under
+        # torch.compile for 2D inputs (Inductor functionalization aliasing bug).
+        B = b * A + c * torch.matmul(A, A)
+        X = a * X + torch.matmul(B, X)
 
     if transpose:
         X = X.transpose(-2, -1)
@@ -55,7 +57,7 @@ def ns_loop(
     return X
 
 
-@torch.compile(fullgraph=True, dynamic=True)
+@torch.compile(fullgraph=True)
 def ns_loop_triton(
     X: Tensor,
     steps: int = 5,
@@ -100,19 +102,3 @@ def ns_loop_triton(
     if transpose:
         X = X.mT
     return X
-
-
-if __name__ == "__main__":
-    import torch
-    from helion._testing import run_example
-
-    X = torch.randn(32, 2048, 1024, device="cuda", dtype=torch.bfloat16)
-    steps = 5
-
-    run_example(
-        ns_loop_triton,
-        ns_loop,
-        (X, steps),
-        kernel_name="triton",
-        baseline_name="torch",
-    )

@@ -28,7 +28,7 @@ POLAR_EXPRESS_COEFFS = [
 @torch.compile(fullgraph=True)
 def pe_loop(
     X: Annotated[Tensor, "B N M"],
-    steps: int,
+    steps: int = 5,
     *,
     eps: float = 1e-6,
 ) -> Annotated[Tensor, "B N M"]:
@@ -46,9 +46,6 @@ def pe_loop(
     Returns:
         Orthogonalized tensor of same shape as input
     """
-    assert steps <= 5, (
-        "polar express orthogonalization only supports up to 5 optimization steps."
-    )
     if X.size(0) == 0:
         return X
 
@@ -60,8 +57,10 @@ def pe_loop(
 
     for a, b, c in POLAR_EXPRESS_COEFFS[:steps]:
         A = torch.matmul(X, X.transpose(-1, -2))
-        B = A.mul(b).add_(torch.matmul(A, A), alpha=c)
-        X = X.mul(a).add_(B @ X)
+        # Out-of-place accumulation: the in-place add_ form miscompiles under
+        # torch.compile for 2D inputs (Inductor functionalization aliasing bug).
+        B = b * A + c * torch.matmul(A, A)
+        X = a * X + B @ X
 
     if transpose:
         X = X.transpose(-2, -1)
@@ -69,7 +68,7 @@ def pe_loop(
     return X
 
 
-@torch.compile(fullgraph=True, dynamic=True)
+@torch.compile(fullgraph=True)
 def pe_loop_triton(
     X: Tensor,
     steps: int = 5,
@@ -79,9 +78,6 @@ def pe_loop_triton(
     """
     Polar Express orthogonalization algorithm.
     """
-    assert steps <= 5, (
-        "polar express orthogonalization only supports up to 5 optimization steps."
-    )
     assert X.ndim >= 2
     if X.size(0) == 0:
         return X
@@ -114,19 +110,3 @@ def pe_loop_triton(
         X = X.mT
 
     return X
-
-
-if __name__ == "__main__":
-    import torch
-    from helion._testing import run_example
-
-    X = torch.randn(32, 2048, 1024, device="cuda", dtype=torch.bfloat16)
-    steps = 5
-
-    run_example(
-        pe_loop_triton,
-        pe_loop,
-        (X, steps),
-        kernel_name="triton",
-        baseline_name="torch",
-    )

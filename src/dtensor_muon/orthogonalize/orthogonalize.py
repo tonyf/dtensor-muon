@@ -42,18 +42,24 @@ def get_dtensor_metadata(dtensors: DTensor | list[DTensor], run_check: bool = Tr
     return metadata
 
 
-def _get_orthogonalization_fn(
-    strategy: OrthogonalizationStrategy,
-    use_triton: bool,
-):
+def _get_orthogonalization_fn(strategy: OrthogonalizationStrategy, use_triton: bool):
     """Get the orthogonalization function based on strategy."""
     if strategy == "newton_schulz":
         return ns_loop_triton if use_triton else ns_loop
     elif strategy == "polar_express":
-        # Polar express doesn't have a triton kernel yet, use PyTorch impl
         return pe_loop_triton if use_triton else pe_loop
     else:
         raise ValueError(f"Unknown orthogonalization strategy: {strategy}")
+
+
+def _validate_orthogonalization_args(
+    strategy: OrthogonalizationStrategy,
+    steps: int,
+) -> None:
+    if strategy == "polar_express":
+        assert steps <= 5, (
+            "polar express orthogonalization only supports up to 5 optimization steps."
+        )
 
 
 def zeropower(
@@ -77,18 +83,20 @@ def zeropower(
     Returns:
         Orthogonalized tensor with same structure as input
     """
+    _validate_orthogonalization_args(strategy, steps)
+
     # Select the orthogonalization function
     orthogonalize_fn = _get_orthogonalization_fn(strategy, use_triton)
 
     if isinstance(G, DTensor):
         X = G.full_tensor()
-        U = orthogonalize_fn(X.bfloat16(), steps, eps=eps)
+        U = orthogonalize_fn(X.bfloat16(), steps=steps, eps=eps)
         U = DTensor.from_local(
             U, device_mesh=G.device_mesh, placements=(Replicate(),) * G.device_mesh.ndim
         )
         return U.redistribute(placements=G.placements, async_op=True)
     else:
-        return orthogonalize_fn(G.bfloat16(), steps, eps=eps)
+        return orthogonalize_fn(G.bfloat16(), steps=steps, eps=eps)
 
 
 def foreach_zeropower(
@@ -121,6 +129,8 @@ def foreach_zeropower(
     Returns:
         List of orthogonalized tensors with same structure as input
     """
+    _validate_orthogonalization_args(strategy, steps)
+
     orthogonalize_fn = _get_orthogonalization_fn(strategy, use_triton)
 
     if isinstance(Gs[0], DTensor):
