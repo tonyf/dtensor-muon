@@ -6,6 +6,8 @@ orthogonalization step efficiently across sharded parameters (FSDP / tensor-para
 and falls back to Adam/AdamW for the parameters Muon doesn't apply to — all from a single
 optimizer instance.
 
+Unlike the original distributed implementation, when used with FSDP2, there is zero communication overhead as the optimizer can run orthogonalization directly over the local sharded parameters.
+
 ## What is Muon?
 
 Muon updates 2D+ parameters by taking the momentum-smoothed gradient and replacing it with
@@ -28,10 +30,12 @@ implementation provides two iteration schemes:
 - **Three variants:**
   - `Muon` — the reference per-parameter implementation.
   - `MuonForeach` — batched `foreach` operations for higher throughput.
-  - `MuonLP` — quantized (4-bit / 8-bit / fp8) optimizer states via
+  - `MuonLP` — Experimental quantized (4-bit / 8-bit / fp8) optimizer states via
     [`torchao`](https://github.com/pytorch/ao) for reduced memory.
-- **Cautious weight decay** — weight decay applied only where update and parameter share a
-  sign.
+- **Cautious weight decay** — an extension beyond the original Muon (which has no cautious
+  variant): weight decay is applied only where the update and parameter share a sign
+  (`u * p > 0`), following the Cautious Optimizers technique. On by default; set
+  `use_cautious_wd=False` for plain (non-cautious) decoupled weight decay.
 - **Nesterov momentum**, automatic shape-based learning-rate scaling, optional
   `torch.compile`, and Triton kernels.
 
@@ -44,9 +48,12 @@ implementation provides two iteration schemes:
 
 ## Installation
 
-This project uses [uv](https://docs.astral.sh/uv/). Install it directly from the repository:
 
 ```bash
+# Install from PyPI
+uv pip install dtensor-muon
+
+# Install it directly from the repository:
 uv pip install git+https://github.com/tonyf/dtensor-muon.git
 
 # include torchao for the low-precision optimizer (MuonLP)
@@ -60,6 +67,8 @@ Clone the repository and sync the environment:
 ```bash
 git clone https://github.com/tonyf/dtensor-muon.git
 cd dtensor-muon
+uv venv
+source .venv/bin/activate
 uv sync                  # core install
 uv sync --extra lp       # include torchao for the low-precision optimizer
 ```
@@ -116,7 +125,7 @@ optimizer = Muon(params, orthogonalization_strategy="polar_express")  # or "newt
 | --- | --- | --- |
 | `lr` | `1e-3` | Learning rate. |
 | `wd` | `0.1` | Weight decay. |
-| `use_cautious_wd` | `True` | Apply weight decay only where update and param share a sign. |
+| `use_cautious_wd` | `True` | Cautious weight decay — apply decay only where update and param share a sign (`u * p > 0`). An addition not present in the original Muon; set `False` for plain weight decay. |
 | `momentum` | `0.95` | Muon momentum. |
 | `nesterov` | `True` | Use Nesterov momentum. |
 | `ns_steps` | `5` | Orthogonalization iteration steps. |
@@ -127,6 +136,56 @@ optimizer = Muon(params, orthogonalization_strategy="polar_express")  # or "newt
 | `compile` | `False` | `torch.compile` the per-parameter step. |
 
 Most options can also be overridden per param group.
+
+## Benchmarks
+
+A self-contained benchmark suite lives in [`benchmark/`](benchmark/). Run the whole thing
+(kernels, single-device optimizers, and the distributed orthogonalization paths) with:
+
+```bash
+uv run python benchmark/run.py            # full run, writes benchmark/RESULTS.md
+uv run python benchmark/run.py --quick    # small shapes, fast smoke
+```
+
+It degrades gracefully: CUDA-only sections are skipped on a CPU-only host, and the
+distributed section uses NCCL/CUDA when ≥2 GPUs are visible and falls back to gloo/CPU
+otherwise. Full numbers and methodology are in [`benchmark/RESULTS.md`](benchmark/RESULTS.md).
+
+The snapshot below was measured on **2× NVIDIA RTX PRO 6000 Blackwell**, PyTorch 2.12.1+cu130.
+
+**Triton Gram kernel** vs `x @ x.mT` — a clear win, **1.5–1.9×** across shapes/dtypes
+(e.g. `(32, 2048, 1024)` bf16: 1.13 ms → 0.61 ms, 1.85×).
+
+**Orthogonalization loops** (5 steps, bf16) — the fused Triton loop is **at parity with
+or slightly faster than** the `torch.compile`d PyTorch loop (≈0.96–1.08×), reflecting the
+Gram-kernel win net of the rest of the iteration (the non-symmetric `B @ X` matmul is a
+plain matmul in both). The uncompiled eager loop is ~1.3× slower than either.
+
+**Single-device optimizer step** (48 weight matrices, full `step()`), vs a naive
+reference Muon:
+
+| optimizer | step (ms) | vs naive |
+| --- | --- | --- |
+| naive (Newton-Schulz) | 158 | 1.00× (ref) |
+| `Muon` | 260–280 | 0.56–0.61× |
+| `MuonForeach` | 257–270 | 0.59–0.62× |
+
+On this Blackwell card the naive eager loop is still faster than the `torch.compile` +
+Triton paths at these shapes (native bf16 matmul is very fast, so per-`step()` Python and
+compile overhead dominate); `MuonForeach`'s batching roughly matches per-parameter `Muon`.
+(`MuonLP` targets optimizer-state *memory*, not step time, so it isn't in this table.)
+
+**Distributed orthogonalization** (2× GPU, NCCL, params sharded on dim 0):
+
+| path | per-call (ms) | vs single-device |
+| --- | --- | --- |
+| single-device (replicated, no collectives) | 42.6 | 1.00× (ref) |
+| **FSDP fast path** (`foreach_zeropower_3d_fsdp`) | 20.4 | **2.09×** |
+| general path (`foreach_zeropower` + redistribute) | 33.2 | 1.28× |
+
+The FSDP fast path works on each rank's local shard with no collectives — ~2.1× the
+single-device baseline (batch split across ranks) and ~1.6× faster than the general
+redistribute path. This is the core payoff of the DTensor design.
 
 ## Project layout
 
