@@ -1,39 +1,38 @@
-"""Correctness + benchmark helper for tests and benchmarks.
+"""Shared test helpers (correctness/benchmark + distributed spawn).
 
-Modeled on ``helion._testing.run_example`` but standalone: it depends only on
-``torch`` and ``triton.testing.do_bench`` (both already project dependencies),
-so it keeps working after helion is uninstalled.
+Test-only utilities, intentionally kept out of the shipped ``dtensor_muon``
+package. ``tests/conftest.py`` puts this directory on ``sys.path`` so tests import
+it by bare name::
 
-Typical use in a pytest test::
+    from testkit import run_example, run_distributed, assert_close
 
-    from dtensor_muon.utils.testing import run_example
+``run_example`` is modeled on ``helion._testing.run_example`` but standalone: it
+depends only on ``torch`` and ``triton.testing.do_bench`` (both project
+dependencies), so it keeps working after helion is uninstalled.
+
+Typical correctness check::
 
     def test_gram():
         x = torch.randn(8, 256, 128, device="cuda", dtype=torch.float32)
         run_example(gram, lambda x: x @ x.mT, (x,), kernel_name="gram_triton")
 
-Or to benchmark several implementations against a baseline::
-
-    run_example(
-        {"triton": gram, "compiled": torch.compile(ref)},
-        {"torch": ref},
-        (x,),
-    )
+``run_distributed`` spawns a small torch.distributed world so the DTensor code
+paths can be exercised; see its docstring for usage.
 """
-
-from __future__ import annotations
 
 import functools
 import sys
-from typing import Callable, Sequence
+from typing import Callable, Sequence, cast
 
 import torch
 
-__all__ = ["run_example", "clone_args", "do_bench", "assert_close"]
+from test_support.distributed import run_distributed
+
+__all__ = ["run_example", "clone_args", "do_bench", "assert_close", "run_distributed"]
 
 # A function under test / baseline: takes the (cloned) args, returns a tensor or
 # a tuple of tensors.
-ExampleFn = Callable[..., "torch.Tensor | tuple[torch.Tensor, ...]"]
+ExampleFn = Callable[..., "torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]"]
 
 
 def clone_args(args: Sequence[object]) -> tuple[object, ...]:
@@ -84,13 +83,14 @@ def assert_close(
     pct = 100.0 * mismatched.sum().item() / max(mismatched.numel(), 1)
     if pct > max_mismatch_pct:
         raise AssertionError(
-            (msg or "")
-            + f"\n{pct:.4f}% of elements mismatched "
+            (msg or "") + f"\n{pct:.4f}% of elements mismatched "
             f"(allowed {max_mismatch_pct:.4f}%) at rtol={rtol}, atol={atol}"
         )
 
 
-def do_bench(fn: Callable[[], object], *, grad_to_none: Sequence[torch.Tensor] | None = None) -> float:
+def do_bench(
+    fn: Callable[[], object], *, grad_to_none: Sequence[torch.Tensor] | None = None
+) -> float:
     """Median wall-clock time of ``fn`` in milliseconds via ``triton.testing.do_bench``."""
     from triton.testing import do_bench as _triton_do_bench
 
@@ -138,8 +138,14 @@ def run_example(
         ``{name: time_ms}`` for every function benchmarked (empty if benchmarking
         was skipped).
     """
-    kernels = kernel_fn if isinstance(kernel_fn, dict) else {kernel_name: kernel_fn}
-    baselines = baseline_fn if isinstance(baseline_fn, dict) else {baseline_name: baseline_fn}
+    kernels = cast(
+        dict[str, ExampleFn],
+        kernel_fn if isinstance(kernel_fn, dict) else {kernel_name: kernel_fn},
+    )
+    baselines = cast(
+        dict[str, ExampleFn],
+        baseline_fn if isinstance(baseline_fn, dict) else {baseline_name: baseline_fn},
+    )
     all_fns = {**kernels, **baselines}
 
     ref_name, ref_fn = next(iter(baselines.items()))
@@ -156,7 +162,11 @@ def run_example(
         )
         for i, (r, e) in enumerate(zip(result, expected, strict=True)):
             assert_close(
-                r, e, rtol=rtol, atol=atol, max_mismatch_pct=max_mismatch_pct,
+                r,
+                e,
+                rtol=rtol,
+                atol=atol,
+                max_mismatch_pct=max_mismatch_pct,
                 msg=f"{name}: forward output {i} (shape {tuple(r.shape)}) mismatch",
             )
 
@@ -175,7 +185,7 @@ def run_example(
         cloned = clone_args(args)
         times[name] = do_bench(functools.partial(fn, *cloned))
 
-    _print_table(times, baselines)
+    _print_table(times, cast(dict[str, object], baselines))
     return times
 
 
@@ -188,7 +198,9 @@ def _check_backward(
     atol: float,
     max_mismatch_pct: float | None,
 ) -> None:
-    grad_idx = [i for i, a in enumerate(args) if isinstance(a, torch.Tensor) and a.requires_grad]
+    grad_idx = [
+        i for i, a in enumerate(args) if isinstance(a, torch.Tensor) and a.requires_grad
+    ]
     assert grad_idx, "bwd=True but no arg has requires_grad=True"
 
     def run_backward(fn: ExampleFn) -> tuple[list[torch.Tensor], list[torch.Tensor | None]]:
@@ -196,10 +208,11 @@ def _check_backward(
         out = _as_tensors(fn(*cloned))
         grad_outputs = [torch.randn_like(o) for o in out]
         torch.autograd.backward(out, grad_outputs)
-        grads = [
-            cloned[i].grad.clone() if cloned[i].grad is not None else None  # type: ignore[union-attr]
-            for i in grad_idx
-        ]
+        grads: list[torch.Tensor | None] = []
+        for i in grad_idx:
+            arg = cast(torch.Tensor, cloned[i])
+            grad = arg.grad
+            grads.append(grad.clone() if grad is not None else None)
         return grad_outputs, grads
 
     # Use the same grad-output for baseline and every impl so grads are comparable.
@@ -215,12 +228,17 @@ def _check_backward(
         assert len(out) == len(grad_outputs)
         torch.autograd.backward(out, grad_outputs)
         for k, i in enumerate(grad_idx):
-            g = cloned[i].grad  # type: ignore[union-attr]
+            g = cast(torch.Tensor, cloned[i]).grad
             e = baseline_grads[k]
             assert (g is None) == (e is None), f"{name}: grad presence mismatch for arg {i}"
             if e is not None:
+                assert g is not None
                 assert_close(
-                    g, e, rtol=rtol, atol=atol, max_mismatch_pct=max_mismatch_pct,
+                    g,
+                    e,
+                    rtol=rtol,
+                    atol=atol,
+                    max_mismatch_pct=max_mismatch_pct,
                     msg=f"{name}: gradient for arg {i} (shape {tuple(g.shape)}) mismatch",
                 )
 
