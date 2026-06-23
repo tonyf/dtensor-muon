@@ -2,11 +2,9 @@
 
 A distributed-ready implementation of the **Muon** optimizer built on PyTorch
 [`DTensor`](https://docs.pytorch.org/docs/stable/distributed.tensor.html). It runs the
-orthogonalization step efficiently across sharded parameters (FSDP / tensor-parallel meshes)
-and falls back to Adam/AdamW for the parameters Muon doesn't apply to — all from a single
-optimizer instance.
+orthogonalization step efficiently across sharded parameters (FSDP / tensor-parallel meshes).
 
-Unlike the original distributed implementation, when used with FSDP2, there is zero communication overhead as the optimizer can run orthogonalization directly over the local sharded parameters.
+Unlike the original distributed implementation, when used with FSDP2, there is zero communication overhead from collectives as the optimizer can run orthogonalization directly over the local sharded parameters.
 
 ## What is Muon?
 
