@@ -147,33 +147,9 @@ uv run python benchmark/run.py            # full run, writes benchmark/RESULTS.m
 uv run python benchmark/run.py --quick    # small shapes, fast smoke
 ```
 
-It degrades gracefully: CUDA-only sections are skipped on a CPU-only host, and the
-distributed section uses NCCL/CUDA when ≥2 GPUs are visible and falls back to gloo/CPU
-otherwise. Full numbers and methodology are in [`benchmark/RESULTS.md`](benchmark/RESULTS.md).
+Full numbers and methodology are in [`benchmark/RESULTS.md`](benchmark/RESULTS.md).
 
 The snapshot below was measured on **2× NVIDIA RTX PRO 6000 Blackwell**, PyTorch 2.12.1+cu130.
-
-**Triton Gram kernel** vs `x @ x.mT` — a clear win, **1.5–1.9×** across shapes/dtypes
-(e.g. `(32, 2048, 1024)` bf16: 1.13 ms → 0.61 ms, 1.85×).
-
-**Orthogonalization loops** (5 steps, bf16) — the fused Triton loop is **at parity with
-or slightly faster than** the `torch.compile`d PyTorch loop (≈0.96–1.08×), reflecting the
-Gram-kernel win net of the rest of the iteration (the non-symmetric `B @ X` matmul is a
-plain matmul in both). The uncompiled eager loop is ~1.3× slower than either.
-
-**Single-device optimizer step** (48 weight matrices, full `step()`), vs a naive
-reference Muon:
-
-| optimizer | step (ms) | vs naive |
-| --- | --- | --- |
-| naive (Newton-Schulz) | 158 | 1.00× (ref) |
-| `Muon` | 260–280 | 0.56–0.61× |
-| `MuonForeach` | 257–270 | 0.59–0.62× |
-
-On this Blackwell card the naive eager loop is still faster than the `torch.compile` +
-Triton paths at these shapes (native bf16 matmul is very fast, so per-`step()` Python and
-compile overhead dominate); `MuonForeach`'s batching roughly matches per-parameter `Muon`.
-(`MuonLP` targets optimizer-state *memory*, not step time, so it isn't in this table.)
 
 **Distributed orthogonalization** (2× GPU, NCCL, params sharded on dim 0):
 
