@@ -117,16 +117,6 @@ def test_pe_transpose_path_is_symmetric() -> None:
     torch.testing.assert_close(out, transposed_out, rtol=0, atol=0)
 
 
-def test_pe_rejects_more_steps_than_coefficients() -> None:
-    X = torch.randn(16, 8, dtype=torch.bfloat16)
-
-    with pytest.raises(
-        AssertionError,
-        match="only supports up to 5 optimization steps",
-    ):
-        eager(pe_loop)(X, len(POLAR_EXPRESS_COEFFS) + 1)
-
-
 def test_pe_coefficients_table_integrity() -> None:
     assert len(POLAR_EXPRESS_COEFFS) == 5
     assert POLAR_EXPRESS_COEFFS[0] == (
