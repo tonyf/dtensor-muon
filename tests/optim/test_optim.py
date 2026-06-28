@@ -4,9 +4,12 @@ from typing import Any
 import pytest
 import torch
 from torch.optim.adam import adam
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard, distribute_tensor
 
 import dtensor_muon.optim.optim as optim_module
 from dtensor_muon.optim.optim import Muon
+from testkit import run_distributed
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -82,6 +85,39 @@ def test_compile_true_real_compiled_adam_group_steps_on_cuda():
 
     assert not torch.equal(p, before)
     assert torch.equal(optimizer.state[p]["step"], torch.tensor(1.0, device=p.device))
+
+
+def _compiled_adamw_dtensor_worker(rank: int, world_size: int) -> None:
+    mesh = init_device_mesh("cpu", (world_size,))
+    torch.manual_seed(1000 + rank)
+    full_param = torch.randn(8 * world_size, 4)
+    full_grad = torch.randn_like(full_param)
+    param = torch.nn.Parameter(distribute_tensor(full_param, mesh, [Shard(0)]))
+    param.grad = distribute_tensor(full_grad, mesh, [Shard(0)])
+    optimizer = Muon(
+        [
+            {
+                "params": [param],
+                "algorithm": "adamw",
+                "lr": 0.01,
+                "wd": 0.0,
+                "fused": False,
+            }
+        ]
+    )
+
+    @torch.compile(dynamic=False)
+    def compiled_step(opt):
+        opt.step()
+
+    compiled_step(optimizer)
+
+    assert torch.equal(optimizer.state[param]["step"], torch.tensor(1.0))
+    assert torch.isfinite(param.full_tensor()).all()
+
+
+def test_compiled_adamw_group_steps_dtensor_params():
+    run_distributed(_compiled_adamw_dtensor_worker, world_size=2)
 
 
 @requires_cuda

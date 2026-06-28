@@ -3,6 +3,7 @@ from typing import cast
 
 import torch
 from torch import Tensor
+from torch.distributed.tensor import DTensor
 from torch.optim.adam import adam
 from torch.optim.optimizer import _device_dtype_check_for_fused, _get_scalar_dtype
 
@@ -431,6 +432,10 @@ class Muon(torch.optim.Optimizer):
             lr = float(lr) if torch.is_tensor(lr) else lr
             weight_decay = float(weight_decay) if torch.is_tensor(weight_decay) else weight_decay
 
+        foreach = not group["fused"]
+        if foreach and any(isinstance(p, DTensor) for p in params_with_grad):
+            foreach = False
+
         self._adam_impl(
             params_with_grad,
             grads,
@@ -446,7 +451,7 @@ class Muon(torch.optim.Optimizer):
             weight_decay=weight_decay,
             eps=group["eps"],
             maximize=group["maximize"],
-            foreach=not group["fused"],
+            foreach=foreach,
             capturable=False,
             differentiable=False,
             fused=group["fused"],
