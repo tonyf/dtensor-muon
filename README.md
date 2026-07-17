@@ -4,7 +4,7 @@ A distributed-ready implementation of the **Muon** optimizer built on PyTorch
 [`DTensor`](https://docs.pytorch.org/docs/stable/distributed.tensor.html). It runs the
 orthogonalization step efficiently across sharded parameters (FSDP / tensor-parallel meshes).
 
-Unlike the original distributed implementation, `dtensor-muon` has lower or zero communication overhead from collectives. For example, for expert-parallel MOEs, the optimizer can run orthogonalization directly over the local sharded parameters with no collectives.
+Unlike the original distributed implementation, `dtensor-muon` has lower or zero communication overhead from collectives. For example, for expert-parallel MoEs, the optimizer can run orthogonalization directly over the local sharded parameters with no collectives.
 
 This is an open-sourcing of work done at Dream3D. This was implemented without AI tools originally. When copying the source over, Claude Fable 5 was used to audit the codebase, write tests and documentation, and fix a bug. Claude is tagged on all the commits he contributed to :)
 
