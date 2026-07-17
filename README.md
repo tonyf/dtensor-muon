@@ -6,6 +6,8 @@ orthogonalization step efficiently across sharded parameters (FSDP / tensor-para
 
 Unlike the original distributed implementation, `dtensor-muon` has lower or zero communication overhead from collectives. For example, for expert-parallel MOEs, the optimizer can run orthogonalization directly over the local sharded parameters with no collectives.
 
+This is an open-sourcing of work done at Dream3D. This was implemented without AI tools originally. When copying the source over, Claude Fable 5 was used to audit the codebase, write tests and fix a bug. Claude is tagged on all the commits he contributed to. :)
+
 ## What is Muon?
 
 Muon updates 2D+ parameters by taking the momentum-smoothed gradient and replacing it with
