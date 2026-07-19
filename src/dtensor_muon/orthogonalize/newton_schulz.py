@@ -96,8 +96,9 @@ def ns_loop_triton(
         # B := B = b*A + c*A^2   (reuse B storage)
         B.mul_(c).add_(A, alpha=b)
 
-        # X := a*X + B X
-        X = X.mul(a).add_(B @ X)
+        # Keep this out-of-place so Inductor can use the contiguous layout
+        # required by the matmul template after the transpose path.
+        X = a * X + B @ X
 
     if transpose:
         X = X.mT
