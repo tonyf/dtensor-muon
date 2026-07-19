@@ -269,6 +269,7 @@ class Muon(torch.optim.Optimizer):
         exp_avg_sqs: list[Tensor],
         max_exp_avg_sqs: list[Tensor],
         state_steps: list[Tensor],
+        capturable: bool,
     ):
         for p in group["params"]:
             if p.grad is None:
@@ -291,8 +292,12 @@ class Muon(torch.optim.Optimizer):
                 # Deliberately host `step` on CPU if both capturable and fused are off.
                 # This is because kernel launches are costly on CUDA and XLA.
                 state["step"] = (
-                    torch.zeros((), dtype=_get_scalar_dtype(is_fused=True), device=p.device)
-                    if group["fused"]
+                    torch.zeros(
+                        (),
+                        dtype=_get_scalar_dtype(is_fused=group["fused"]),
+                        device=p.device,
+                    )
+                    if capturable or group["fused"]
                     else torch.tensor(0.0, dtype=_get_scalar_dtype())
                 )
 
@@ -302,6 +307,8 @@ class Muon(torch.optim.Optimizer):
                     state["max_exp_avg_sq"] = torch.zeros_like(
                         p, memory_format=torch.preserve_format
                     )
+            elif capturable and state["step"].device != p.device:
+                state["step"] = state["step"].to(p.device)
 
             exp_avgs.append(state["exp_avg"])
             exp_avg_sqs.append(state["exp_avg_sq"])
@@ -418,6 +425,7 @@ class Muon(torch.optim.Optimizer):
         exp_avg_sqs: list[Tensor] = []
         max_exp_avg_sqs: list[Tensor] = []
         beta1, beta2 = group["betas"]
+        capturable = torch.compiler.is_compiling()
 
         self._init_adam_group(
             group,
@@ -427,6 +435,7 @@ class Muon(torch.optim.Optimizer):
             exp_avg_sqs,
             max_exp_avg_sqs,
             state_steps,
+            capturable,
         )
 
         lr = group["lr"]
@@ -452,7 +461,7 @@ class Muon(torch.optim.Optimizer):
             weight_decay=weight_decay,
             eps=group["eps"],
             maximize=group["maximize"],
-            capturable=False,
+            capturable=capturable,
             differentiable=False,
             fused=group["fused"],
             foreach=group["foreach"],

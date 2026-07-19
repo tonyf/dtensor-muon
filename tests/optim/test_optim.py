@@ -66,21 +66,29 @@ def test_external_torch_compile_captures_muon_update(monkeypatch):
     torch.testing.assert_close(optimizer.state[p]["step"], ref_optimizer.state[ref]["step"])
 
 
-def test_external_torch_compile_captures_adam_update():
-    p = torch.nn.Parameter(torch.randn(4))
-    ref = torch.nn.Parameter(p.detach().clone())
+@pytest.mark.parametrize("tensor_lr", [False, True])
+def test_external_torch_compile_captures_adam_update(tensor_lr):
+    params = [torch.nn.Parameter(torch.randn(4)) for _ in range(3)]
+    refs = [torch.nn.Parameter(p.detach().clone()) for p in params]
     optimizer = Muon(
         [
             {
-                "params": [p],
+                "params": params,
                 "algorithm": "adamw",
-                "lr": torch.tensor(0.01),
+                "lr": torch.tensor(0.01) if tensor_lr else 0.01,
                 "wd": 0.1,
                 "fused": False,
+                "foreach": True,
             }
         ]
     )
-    ref_optimizer = torch.optim.AdamW([ref], lr=0.01, weight_decay=0.1, betas=(0.9, 0.95))
+    ref_optimizer = torch.optim.AdamW(
+        refs,
+        lr=0.01,
+        weight_decay=0.1,
+        betas=(0.9, 0.95),
+        foreach=True,
+    )
     graphs = []
 
     def recording_backend(graph_module, _example_inputs):
@@ -92,14 +100,16 @@ def test_external_torch_compile_captures_adam_update():
         optimizer.step()
 
     for _ in range(2):
-        grad = torch.randn_like(p)
-        p.grad = grad.clone()
-        ref.grad = grad.clone()
+        for p, ref in zip(params, refs, strict=True):
+            grad = torch.randn_like(p)
+            p.grad = grad.clone()
+            ref.grad = grad.clone()
         compiled_step()
         ref_optimizer.step()
 
     assert graphs
-    torch.testing.assert_close(p, ref)
+    for p, ref in zip(params, refs, strict=True):
+        torch.testing.assert_close(p, ref)
 
 
 @requires_cuda
