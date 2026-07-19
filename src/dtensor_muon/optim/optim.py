@@ -16,6 +16,7 @@ class Muon(torch.optim.Optimizer):
         lr: float = 1e-3,
         wd: float = 0.1,
         use_cautious_wd: bool = True,
+        maximize: bool = False,
         # Muon defaults
         momentum: float = 0.95,
         nesterov: bool = True,
@@ -26,9 +27,8 @@ class Muon(torch.optim.Optimizer):
         adam_betas: tuple[float, float] = (0.9, 0.95),
         adam_eps: float = 1e-8,
         is_adamw: bool = True,
-        fused_adam: bool = True,
-        maximize: bool = False,
-        compile: bool = False,
+        fused_adam: bool | None = None,
+        foreach_adam: bool | None = None,
     ):
         """
         Unified Muon + Adam optimizer.
@@ -71,8 +71,8 @@ class Muon(torch.optim.Optimizer):
         self.adam_eps = adam_eps
         self.is_adamw = is_adamw
         self.fused_adam = fused_adam
+        self.foreach_adam = foreach_adam
         self.maximize = maximize
-        self.compile = compile
 
         param_groups: list[dict] = []
 
@@ -118,16 +118,6 @@ class Muon(torch.optim.Optimizer):
 
         super().__init__(param_groups, {})
 
-        self._init_step_impls()
-
-    def _init_step_impls(self) -> None:
-        if self.compile:
-            self._adam_impl = torch.compile(adam, dynamic=True)
-            self._muon_impl = torch.compile(self.muon, dynamic=True)
-        else:
-            self._adam_impl = adam
-            self._muon_impl = self.muon
-
     def _build_muon_group(self, group: dict):
         if not all(p.ndim >= 2 for p in group["params"]):
             raise ValueError(
@@ -171,6 +161,7 @@ class Muon(torch.optim.Optimizer):
                 "decoupled_weight_decay", self.is_adamw and algorithm == "adamw"
             ),
             "fused": group.get("fused", self.fused_adam),
+            "foreach": group.get("foreach", self.foreach_adam),
             "maximize": group.get("maximize", self.maximize),
             "has_complex": any(torch.is_complex(p) for p in group["params"]),
         }
@@ -217,8 +208,6 @@ class Muon(torch.optim.Optimizer):
                             if group["fused"]
                             else torch.tensor(step_val, dtype=_get_scalar_dtype())
                         )
-
-        self._init_step_impls()
 
     def _init_muon_group(
         self,
@@ -311,6 +300,7 @@ class Muon(torch.optim.Optimizer):
 
             state_steps.append(state["step"])
 
+    @torch.compile(dynamic=True)
     def muon(
         self,
         params: list[Tensor],
@@ -390,7 +380,7 @@ class Muon(torch.optim.Optimizer):
             state_steps,
         )
 
-        self._muon_impl(
+        self.muon(
             params_with_grad,
             grads,
             momentum_buffers,
@@ -431,7 +421,7 @@ class Muon(torch.optim.Optimizer):
             lr = float(lr) if torch.is_tensor(lr) else lr
             weight_decay = float(weight_decay) if torch.is_tensor(weight_decay) else weight_decay
 
-        self._adam_impl(
+        adam(
             params_with_grad,
             grads,
             exp_avgs,
@@ -446,10 +436,10 @@ class Muon(torch.optim.Optimizer):
             weight_decay=weight_decay,
             eps=group["eps"],
             maximize=group["maximize"],
-            foreach=not group["fused"],
             capturable=False,
             differentiable=False,
             fused=group["fused"],
+            foreach=group["foreach"],
             grad_scale=getattr(self, "grad_scale", None),
             found_inf=getattr(self, "found_inf", None),
             decoupled_weight_decay=group["decoupled_weight_decay"],

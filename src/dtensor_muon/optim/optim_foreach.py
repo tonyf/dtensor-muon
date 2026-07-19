@@ -56,6 +56,7 @@ class MuonForeach(Muon):
         lr: float = 1e-3,
         wd: float = 0.1,
         use_cautious_wd: bool = True,
+        maximize: bool = False,
         # Muon defaults
         momentum: float = 0.95,
         nesterov: bool = True,
@@ -66,8 +67,8 @@ class MuonForeach(Muon):
         adam_betas: tuple[float, float] = (0.9, 0.95),
         adam_eps: float = 1e-8,
         is_adamw: bool = True,
-        fused_adam: bool = True,
-        maximize: bool = False,
+        fused_adam: bool | None = None,
+        foreach_adam: bool | None = None,
         # Parallelism
         batch_size: int | None = None,
     ):
@@ -76,6 +77,8 @@ class MuonForeach(Muon):
             lr=lr,
             wd=wd,
             use_cautious_wd=use_cautious_wd,
+            maximize=maximize,
+            #
             momentum=momentum,
             nesterov=nesterov,
             ns_steps=ns_steps,
@@ -85,7 +88,7 @@ class MuonForeach(Muon):
             adam_eps=adam_eps,
             is_adamw=is_adamw,
             fused_adam=fused_adam,
-            maximize=maximize,
+            foreach_adam=foreach_adam,
         )
         self.batch_size = batch_size
 
@@ -178,7 +181,6 @@ class MuonForeach(Muon):
                                     original.copy_(value.to(original.device))
 
 
-# @torch.compile(dynamic=True)
 def _foreach_muon(
     p: list[Tensor],
     g: list[Tensor],
