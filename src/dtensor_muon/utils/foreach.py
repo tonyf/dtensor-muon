@@ -13,12 +13,9 @@ def group_tensors_by_shape(
     Returns a dict mapping each shape (as a tuple of ints) to a pair:
     (list_of_tensors_with_that_shape, list_of_original_indices).
 
-    Skips grouping when compiling since inductor will handle this during lowering.
+    Shape grouping is retained while compiling because callers may stack each group,
+    which requires every tensor in a group to have the same shape.
     """
-    if torch.compiler.is_compiling():
-        # Sentinel key; downstream code should treat this as a single "group all" bucket.
-        return {(0, 0): (tensorlist, list(range(len(tensorlist))))}
-
     groups: dict[tuple[int, ...], tuple[list[Tensor], Indices]] = {}
 
     for idx, t in enumerate(tensorlist):

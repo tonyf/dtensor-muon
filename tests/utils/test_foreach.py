@@ -48,7 +48,7 @@ def test_group_tensors_by_shape_ignores_dtype_and_device() -> None:
     assert groups == {(2, 3): ([fp32, bf16], [0, 1])}
 
 
-def test_group_tensors_by_shape_compiling_path_returns_single_sentinel_bucket(
+def test_group_tensors_by_shape_compiling_path_preserves_shape_groups(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tensors = [torch.randn(2, 3), torch.randn(4, 5)]
@@ -56,7 +56,10 @@ def test_group_tensors_by_shape_compiling_path_returns_single_sentinel_bucket(
 
     groups = group_tensors_by_shape(tensors)
 
-    assert groups == {(0, 0): (tensors, [0, 1])}
+    assert groups == {
+        (2, 3): ([tensors[0]], [0]),
+        (4, 5): ([tensors[1]], [1]),
+    }
 
 
 def test_group_tensors_by_shape_returns_original_tensor_objects() -> None:

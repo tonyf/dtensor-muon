@@ -3,7 +3,6 @@ from typing import Any
 
 import pytest
 import torch
-from torch.optim.adam import adam
 
 import dtensor_muon.optim.optim as optim_module
 from dtensor_muon.optim.optim import Muon
@@ -11,49 +10,106 @@ from dtensor_muon.optim.optim import Muon
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def test_compile_false_uses_private_uncompiled_step_callables():
+def test_standalone_step_uses_private_compiled_muon_callable():
     p = torch.nn.Parameter(torch.randn(2, 2))
+    p.grad = torch.randn_like(p)
+    optimizer = Muon([p])
+    calls = []
 
-    optimizer = Muon([p], compile=False)
+    def compiled_muon(*args, **kwargs):
+        calls.append((args, kwargs))
 
-    assert "adam" not in optimizer.__dict__
-    assert "muon" not in optimizer.__dict__
-    assert optimizer._adam_impl is adam
-    assert optimizer._muon_impl == optimizer.muon
+    optimizer._muon_impl = compiled_muon
+    optimizer.step()
+
+    assert len(calls) == 1
+    assert calls[0][0][0] == [p]
 
 
-def test_compile_true_compiles_step_callables_without_shadowing_public_methods(monkeypatch):
-    compiled = []
+def test_external_torch_compile_captures_muon_update(monkeypatch):
+    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    p = torch.nn.Parameter(torch.ones(4, 2))
+    ref = torch.nn.Parameter(p.detach().clone())
+    optimizer = Muon(
+        [p],
+        lr=0.1,
+        wd=0.0,
+        momentum=0.0,
+        nesterov=False,
+    )
+    ref_optimizer = Muon([ref], lr=0.1, wd=0.0, momentum=0.0, nesterov=False)
+    ref_optimizer._muon_impl = ref_optimizer.muon
+    graphs = []
 
-    def fake_compile(fn, *, dynamic):
-        compiled.append((fn, dynamic))
+    def fail_nested_compile(*args, **kwargs):
+        raise AssertionError("external compilation must use the raw Muon kernel")
 
-        def compiled_fn(*args, **kwargs):
-            return fn(*args, **kwargs)
+    def recording_backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
 
-        return compiled_fn
+    optimizer._muon_impl = fail_nested_compile
 
-    monkeypatch.setattr(torch, "compile", fake_compile)
-    p = torch.nn.Parameter(torch.randn(2, 2))
+    @torch.compile(backend=recording_backend)
+    def compiled_step():
+        optimizer.step()
 
-    optimizer = Muon([p], compile=True)
+    for value in (0.5, 0.25):
+        p.grad = torch.full_like(p, value)
+        ref.grad = torch.full_like(ref, value)
+        compiled_step()
+        ref_optimizer.step()
 
-    assert "adam" not in optimizer.__dict__
-    assert "muon" not in optimizer.__dict__
-    assert optimizer._adam_impl is not adam
-    assert optimizer._muon_impl != optimizer.muon
-    assert compiled == [(adam, True), (optimizer.muon, True)]
+    assert graphs
+    torch.testing.assert_close(p, ref)
+    torch.testing.assert_close(optimizer.state[p]["momentum_buffer"], ref_optimizer.state[ref]["momentum_buffer"])
+    torch.testing.assert_close(optimizer.state[p]["step"], ref_optimizer.state[ref]["step"])
+
+
+def test_external_torch_compile_captures_adam_update():
+    p = torch.nn.Parameter(torch.randn(4))
+    ref = torch.nn.Parameter(p.detach().clone())
+    optimizer = Muon(
+        [
+            {
+                "params": [p],
+                "algorithm": "adamw",
+                "lr": torch.tensor(0.01),
+                "wd": 0.1,
+                "fused": False,
+            }
+        ]
+    )
+    ref_optimizer = torch.optim.AdamW([ref], lr=0.01, weight_decay=0.1, betas=(0.9, 0.95))
+    graphs = []
+
+    def recording_backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    @torch.compile(backend=recording_backend)
+    def compiled_step():
+        optimizer.step()
+
+    for _ in range(2):
+        grad = torch.randn_like(p)
+        p.grad = grad.clone()
+        ref.grad = grad.clone()
+        compiled_step()
+        ref_optimizer.step()
+
+    assert graphs
+    torch.testing.assert_close(p, ref)
 
 
 @requires_cuda
-def test_compile_true_real_compiled_muon_group_steps_on_cuda():
+def test_standalone_compiled_muon_group_steps_on_cuda():
     torch.manual_seed(0)
     p = torch.nn.Parameter(torch.randn(8, 4, device="cuda"))
     before = p.detach().clone()
     p.grad = torch.randn_like(p)
     optimizer = Muon(
         [p],
-        compile=True,
         lr=0.01,
         wd=0.0,
         momentum=0.0,
@@ -68,20 +124,33 @@ def test_compile_true_real_compiled_muon_group_steps_on_cuda():
 
 
 @requires_cuda
-def test_compile_true_real_compiled_adam_group_steps_on_cuda():
-    torch.manual_seed(0)
-    p = torch.nn.Parameter(torch.randn(4, device="cuda"))
+@pytest.mark.parametrize("strategy", ["newton_schulz", "polar_express"])
+def test_external_torch_compile_runs_real_muon_kernel_on_cuda(strategy):
+    p = torch.nn.Parameter(torch.randn(8, 4, device="cuda"))
     before = p.detach().clone()
     p.grad = torch.randn_like(p)
     optimizer = Muon(
-        [{"params": [p], "algorithm": "adamw", "lr": 0.01, "wd": 0.0}],
-        compile=True,
+        [p],
+        lr=0.01,
+        wd=0.0,
+        momentum=0.0,
+        nesterov=False,
+        orthogonalization_strategy=strategy,
     )
 
-    optimizer.step()
+    def fail_nested_compile(*args, **kwargs):
+        raise AssertionError("external compilation must use the raw Muon kernel")
+
+    optimizer._muon_impl = fail_nested_compile
+
+    @torch.compile
+    def compiled_step():
+        optimizer.step()
+
+    compiled_step()
 
     assert not torch.equal(p, before)
-    assert torch.equal(optimizer.state[p]["step"], torch.tensor(1.0, device=p.device))
+    assert torch.equal(optimizer.state[p]["step"], torch.tensor(1.0))
 
 
 @requires_cuda
@@ -173,8 +242,8 @@ def test_constructor_normalizes_muon_and_adam_groups():
     assert torch.equal(muon_group["lr"], torch.tensor(0.5))
     assert muon_group["wd"] == 0.25
     assert adam_group["use_muon"] is False
-    assert torch.equal(adam_group["lr"], torch.tensor(0.3))
-    assert torch.equal(adam_group["wd"], torch.tensor(0.1))
+    assert adam_group["lr"] == 0.3
+    assert adam_group["wd"] == 0.1
 
 
 def test_constructor_allows_3d_muon_and_complex_adam_parameters():
@@ -522,7 +591,7 @@ def test_load_state_dict_applies_adam_legacy_defaults_and_step_tensor():
     assert torch.equal(optimizer.state[p]["step"], torch.tensor(4.0))
 
 
-def test_setstate_reinitializes_compiled_step_impls(monkeypatch):
+def test_setstate_reinitializes_compiled_muon_impl(monkeypatch):
     compiled = []
 
     def fake_compile(fn, *, dynamic):
@@ -531,12 +600,12 @@ def test_setstate_reinitializes_compiled_step_impls(monkeypatch):
 
     monkeypatch.setattr(torch, "compile", fake_compile)
     p = torch.nn.Parameter(torch.randn(2, 2))
-    optimizer = Muon([p], compile=True)
+    optimizer = Muon([p])
     compiled.clear()
 
     optimizer.__setstate__({"state": optimizer.state, "param_groups": optimizer.param_groups})
 
-    assert compiled == [(adam, True), (optimizer.muon, True)]
+    assert compiled == [(optimizer.muon, True)]
 
 
 def test_state_dict_round_trip_preserves_muon_training_continuity(monkeypatch):

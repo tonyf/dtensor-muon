@@ -5,10 +5,11 @@ params). We time a full ``optimizer.step()`` — the whole update, including mom
 orthogonalization, weight decay, and the param write — which is what actually costs time
 in training.
 
-All variants share hyperparameters (``ns_steps=5``, ``use_cautious_wd=False`` to match
-the naive baseline, ``compile=False``). ``MuonForeach`` and ``MuonLP`` move work to CUDA
-internally, so they only appear on a CUDA host. Before timing, the Newton-Schulz variants
-are sanity-checked against the naive reference from identical seeded params/grads.
+All variants share hyperparameters (``ns_steps=5`` and ``use_cautious_wd=False`` to match
+the naive baseline). Muon kernels compile automatically. ``MuonForeach`` and ``MuonLP``
+move work to CUDA internally, so they only appear on a CUDA host. Before timing, the
+Newton-Schulz variants are sanity-checked against the naive reference from identical
+seeded params/grads.
 """
 
 import torch

@@ -4,7 +4,11 @@ from typing import cast
 import torch
 from torch import Tensor
 from torch.optim.adam import adam
-from torch.optim.optimizer import _device_dtype_check_for_fused, _get_scalar_dtype
+from torch.optim.optimizer import (
+    _device_dtype_check_for_fused,
+    _get_scalar_dtype,
+    _use_grad_for_differentiable,
+)
 
 from dtensor_muon.orthogonalize import OrthogonalizationStrategy, zeropower
 
@@ -57,7 +61,6 @@ class Muon(torch.optim.Optimizer):
             is_adamw: Use decoupled weight decay (AdamW) vs coupled (Adam)
             fused_adam: Use fused Adam kernel
             maximize: Maximize instead of minimize
-            compile: Compile per-parameter optimizer step
         """
         self.lr = lr
         self.wd = wd
@@ -116,7 +119,12 @@ class Muon(torch.optim.Optimizer):
                     f"Unknown algorithm '{algorithm}'. Must be 'muon', 'adam', or 'adamw'."
                 )
 
-        super().__init__(param_groups, {})
+        super().__init__(param_groups, {"differentiable": False})
+        self._init_muon_impl()
+
+    def _init_muon_impl(self) -> None:
+        """Compile the overridable Muon kernel used by standalone optimizer steps."""
+        self._muon_impl = torch.compile(self.muon, dynamic=True)
 
     def _build_muon_group(self, group: dict):
         if not all(p.ndim >= 2 for p in group["params"]):
@@ -152,8 +160,8 @@ class Muon(torch.optim.Optimizer):
         return {
             "params": group["params"],
             "use_muon": False,
-            "lr": torch.tensor(group.get("lr", self.lr)),
-            "wd": torch.tensor(group.get("wd", self.wd)),
+            "lr": group.get("lr", self.lr),
+            "wd": group.get("wd", self.wd),
             "amsgrad": group.get("amsgrad", self.amsgrad),
             "betas": group.get("betas", self.adam_betas),
             "eps": group.get("eps", self.adam_eps),
@@ -168,7 +176,6 @@ class Muon(torch.optim.Optimizer):
 
     def __setstate__(self, state):
         super().__setstate__(state)
-        self.compile = getattr(self, "compile", False)
 
         for group in self.param_groups:
             # Muon state initialization
@@ -193,6 +200,8 @@ class Muon(torch.optim.Optimizer):
                 group.setdefault("maximize", False)
                 group.setdefault("foreach", None)
                 group.setdefault("decoupled_weight_decay", False)
+                if torch.is_tensor(group["wd"]):
+                    group["wd"] = float(group["wd"])
                 fused = group.setdefault("fused", None)
 
                 for p in group["params"]:
@@ -208,6 +217,8 @@ class Muon(torch.optim.Optimizer):
                             if group["fused"]
                             else torch.tensor(step_val, dtype=_get_scalar_dtype())
                         )
+
+        self._init_muon_impl()
 
     def _init_muon_group(
         self,
@@ -300,7 +311,6 @@ class Muon(torch.optim.Optimizer):
 
             state_steps.append(state["step"])
 
-    @torch.compile(dynamic=True)
     def muon(
         self,
         params: list[Tensor],
@@ -336,13 +346,14 @@ class Muon(torch.optim.Optimizer):
             grad_fp32 = grad.to(torch.float32)
             momentum_buffer_fp32 = momentum_buffer.to(torch.float32)
 
-            # Update momentum buffer (in fp32)
-            momentum_buffer_fp32.mul_(momentum).add_(grad_fp32)
+            # Keep the compiled math out-of-place until copying state back. This
+            # avoids functionalization aliasing the fp32 views with fp32 inputs.
+            momentum_buffer_fp32 = momentum_buffer_fp32 * momentum + grad_fp32
             momentum_buffer.copy_(momentum_buffer_fp32)
 
             # Update gradient
             if nesterov:
-                grad_fp32.add_(momentum_buffer_fp32, alpha=momentum)
+                grad_fp32 = grad_fp32 + momentum_buffer_fp32 * momentum
             else:
                 grad_fp32 = momentum_buffer_fp32
 
@@ -354,14 +365,13 @@ class Muon(torch.optim.Optimizer):
             # to the original Muon; cautious_wd=False gives plain decoupled WD.
             if weight_decay != 0:
                 if cautious_wd:
-                    u.addcmul_(param_fp32, (u * param_fp32 > 0), value=weight_decay)
+                    u = u + weight_decay * param_fp32 * (u * param_fp32 > 0)
                 else:
-                    u.add_(param_fp32, alpha=weight_decay)
+                    u = u + weight_decay * param_fp32
 
             # Scale update
             adjusted_lr = lr_ratio * lr
-            param_fp32.add_(u, alpha=-cast(float, adjusted_lr))
-            param.copy_(param_fp32)
+            param.copy_(param_fp32 - adjusted_lr * u)
 
     def _step_muon_group(self, group: dict) -> None:
         """Process a single Muon param group."""
@@ -380,7 +390,11 @@ class Muon(torch.optim.Optimizer):
             state_steps,
         )
 
-        self.muon(
+        # Standalone steps use the regional compiled kernel for performance. If an
+        # outer torch.compile is tracing step(), use the raw method so the update is
+        # captured in that optimizer graph instead of entering a nested compiler.
+        muon_impl = self.muon if torch.compiler.is_compiling() else self._muon_impl
+        muon_impl(
             params_with_grad,
             grads,
             momentum_buffers,
@@ -417,9 +431,11 @@ class Muon(torch.optim.Optimizer):
 
         lr = group["lr"]
         weight_decay = group["wd"]
-        if not group["fused"]:
+        if not group["fused"] and not torch.compiler.is_compiling():
             lr = float(lr) if torch.is_tensor(lr) else lr
-            weight_decay = float(weight_decay) if torch.is_tensor(weight_decay) else weight_decay
+            weight_decay = (
+                float(weight_decay) if torch.is_tensor(weight_decay) else weight_decay
+            )
 
         adam(
             params_with_grad,
@@ -445,14 +461,12 @@ class Muon(torch.optim.Optimizer):
             decoupled_weight_decay=group["decoupled_weight_decay"],
         )
 
-    @torch.no_grad()
+    @_use_grad_for_differentiable
     def step(self, closure=None):
         """Perform a single optimization step.
 
-        Internally the method distinguishes between parameters that should use the
-        Muon update (``state[p]["use_muon"] == True``) and those that should fall back
-        to Adam/AdamW (``state[p]["use_muon"] == False``).  The latter path calls the
-        fused implementation provided by ``torchao.optim.adam.single_param_adam``.
+        Parameter groups with ``use_muon=True`` use the Muon update; the remaining
+        groups use PyTorch's functional Adam/AdamW implementation.
 
         Args:
             closure (Callable, optional): A closure that reevaluates the model and
@@ -463,13 +477,10 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        with torch._dynamo.utils.disable_cache_limit():
-            muon_groups = [g for g in self.param_groups if g["use_muon"]]
-            adam_groups = [g for g in self.param_groups if not g["use_muon"]]
-
-            for group in muon_groups:
+        for group in self.param_groups:
+            if group["use_muon"]:
                 self._step_muon_group(group)
-            for group in adam_groups:
+            else:
                 self._step_adam_group(group)
 
         return loss

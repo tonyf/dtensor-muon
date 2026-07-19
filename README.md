@@ -117,6 +117,21 @@ from dtensor_muon import Muon, MuonForeach, MuonLP   # MuonLP requires the `lp` 
 optimizer = Muon(params, orthogonalization_strategy="polar_express")  # or "newton_schulz"
 ```
 
+### Compiling the optimizer
+
+Muon compiles its update kernel automatically, so ordinary `optimizer.step()` calls do
+not need a compile flag. To include the complete optimizer update in a surrounding
+compiled region, wrap the step the same way as a PyTorch optimizer:
+
+```python
+@torch.compile(fullgraph=False)
+def compiled_optimizer_step():
+    optimizer.step()
+```
+
+The optimizer uses PyTorch's standard no-grad graph boundary around `step()`. Consequently,
+`fullgraph=True` and differentiating through the optimizer update are not supported.
+
 ### Key options
 
 | Option | Default | Description |
@@ -130,8 +145,8 @@ optimizer = Muon(params, orthogonalization_strategy="polar_express")  # or "newt
 | `orthogonalization_strategy` | `"polar_express"` | `"newton_schulz"` or `"polar_express"`. |
 | `adam_betas` | `(0.9, 0.95)` | Betas for the Adam path. |
 | `is_adamw` | `True` | Decoupled (AdamW) vs. coupled weight decay for the Adam path. |
-| `fused_adam` | `True` | Use the fused Adam kernel. |
-| `compile` | `False` | `torch.compile` the per-parameter step. |
+| `fused_adam` | `None` | Select the fused Adam kernel explicitly; `None` uses PyTorch's default dispatch. |
+| `foreach_adam` | `None` | Select the foreach Adam kernel explicitly; `None` uses PyTorch's default dispatch. |
 
 Most options can also be overridden per param group.
 

@@ -134,6 +134,89 @@ def test_foreach_mixed_dtype_params_are_grouped_separately(monkeypatch) -> None:
     ]
 
 
+def test_external_torch_compile_captures_heterogeneous_foreach_groups(monkeypatch) -> None:
+    monkeypatch.setattr(
+        optim_foreach_module,
+        "move_tensors_to_device",
+        lambda tensors, _src, _dst: tensors,
+    )
+    kernel_groups = []
+    original_foreach_muon = optim_foreach_module._foreach_muon
+
+    def stack_identity(grads, **_kwargs):
+        return list(torch.stack(grads).unbind())
+
+    def recording_foreach_muon(params, *args, **kwargs):
+        kernel_groups.append((tuple(params[0].shape), params[0].dtype, len(params)))
+        return original_foreach_muon(params, *args, **kwargs)
+
+    monkeypatch.setattr(optim_foreach_module, "foreach_zeropower", stack_identity)
+    monkeypatch.setattr(optim_foreach_module, "_foreach_muon", recording_foreach_muon)
+    params = [
+        nn.Parameter(torch.ones(2, 2)),
+        nn.Parameter(torch.ones(3, 2)),
+        nn.Parameter(torch.ones(2, 2, dtype=torch.bfloat16)),
+    ]
+    optimizer = MuonForeach(params, lr=0.1, wd=0.0, momentum=0.0, nesterov=False)
+    graphs = []
+
+    def fail_nested_compile(*args, **kwargs):
+        raise AssertionError("external compilation must use the raw foreach kernel")
+
+    def recording_backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    optimizer._muon_impl = fail_nested_compile
+
+    @torch.compile(backend=recording_backend)
+    def compiled_step():
+        optimizer.step()
+
+    for p in params:
+        p.grad = torch.full_like(p, 0.5)
+    compiled_step()
+
+    assert graphs
+    assert sorted(kernel_groups, key=lambda group: (str(group[1]), group[0])) == [
+        ((2, 2), torch.bfloat16, 1),
+        ((2, 2), torch.float32, 1),
+        ((3, 2), torch.float32, 1),
+    ]
+    for p in params:
+        assert not torch.equal(p, torch.ones_like(p))
+
+
+@requires_cuda
+def test_external_torch_compile_runs_real_foreach_kernel_on_cuda() -> None:
+    params = _make_params([(32, 16), (32, 16)], "cuda")
+    before = [p.detach().clone() for p in params]
+    for p in params:
+        p.grad = torch.randn_like(p)
+    optimizer = MuonForeach(
+        params,
+        lr=0.1,
+        wd=0.0,
+        momentum=0.0,
+        nesterov=False,
+        orthogonalization_strategy="newton_schulz",
+    )
+
+    def fail_nested_compile(*args, **kwargs):
+        raise AssertionError("external compilation must use the raw foreach kernel")
+
+    optimizer._muon_impl = fail_nested_compile
+
+    @torch.compile
+    def compiled_step():
+        optimizer.step()
+
+    compiled_step()
+
+    for p, old_p in zip(params, before, strict=True):
+        assert not torch.equal(p, old_p)
+
+
 def test_register_dtensor_foreach_ops_is_idempotent() -> None:
     optim_foreach_module._register_dtensor_foreach_ops()
     optim_foreach_module._register_dtensor_foreach_ops()

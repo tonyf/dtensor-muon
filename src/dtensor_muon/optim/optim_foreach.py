@@ -4,7 +4,6 @@ from typing import cast
 import torch
 from torch import Tensor
 from torch.distributed.tensor import DTensor
-from torch.optim.optimizer import Optimizer
 
 from dtensor_muon.orthogonalize import (
     OrthogonalizationStrategy,
@@ -45,6 +44,49 @@ def _register_dtensor_foreach_ops():
 
 
 _register_dtensor_foreach_ops()
+
+
+def _group_muon_tensors(
+    params: list[Tensor],
+    grads: list[Tensor],
+    momentum_buffers: list[Tensor],
+    lr_ratios: list[Tensor],
+) -> list[tuple[torch.device, list[Tensor], list[Tensor], list[Tensor], list[Tensor]]]:
+    """Build static homogeneous batches that are safe to stack during compilation."""
+    groups: dict[
+        tuple[torch.device, torch.dtype],
+        tuple[list[Tensor], list[Tensor], list[Tensor], list[Tensor]],
+    ] = {}
+    for param, grad, momentum_buffer, lr_ratio in zip(
+        params, grads, momentum_buffers, lr_ratios, strict=True
+    ):
+        key = (param.device, param.dtype)
+        if key not in groups:
+            groups[key] = ([], [], [], [])
+        group_params, group_grads, group_buffers, group_lr_ratios = groups[key]
+        group_params.append(param)
+        group_grads.append(grad)
+        group_buffers.append(momentum_buffer)
+        group_lr_ratios.append(lr_ratio)
+
+    homogeneous_groups = []
+    for (device, _), (
+        group_params,
+        group_grads,
+        group_buffers,
+        group_lr_ratios,
+    ) in groups.items():
+        for _, (_, indices) in group_tensors_by_shape(group_grads).items():
+            homogeneous_groups.append(
+                (
+                    device,
+                    [group_params[i] for i in indices],
+                    [group_grads[i] for i in indices],
+                    [group_buffers[i] for i in indices],
+                    [group_lr_ratios[i] for i in indices],
+                )
+            )
+    return homogeneous_groups
 
 
 class MuonForeach(Muon):
@@ -112,73 +154,59 @@ class MuonForeach(Muon):
         if len(params) == 0:
             return
 
-        # Group by device and dtype
-        grouped_tensors = Optimizer._group_tensors_by_device_and_dtype(
-            cast(
-                list[list[Tensor | None]],
-                [params, grads, momentum_buffers, lr_ratios],
-            ),
-        )
+        for device, device_p, device_g, device_buf, device_lr in _group_muon_tensors(
+            params, grads, momentum_buffers, lr_ratios
+        ):
+            indices = list(range(len(device_g)))
+            batches = (
+                [
+                    indices[i : i + self.batch_size]
+                    for i in range(0, len(indices), self.batch_size)
+                ]
+                if self.batch_size and len(indices) > self.batch_size
+                else [indices]
+            )
 
-        for (device, _), (
-            (device_p, device_g, device_buf, device_lr),
-            _,
-        ) in grouped_tensors.items():
-            assert device is not None
+            for batch_idx in batches:
+                batch_p_orig = [device_p[i] for i in batch_idx]
+                batch_g_orig = [device_g[i] for i in batch_idx]
+                batch_buf_orig = [device_buf[i] for i in batch_idx]
+                batch_lr_orig = [device_lr[i] for i in batch_idx]
 
-            # Group by shape for efficient foreach operations
-            device_g = cast(list[Tensor], device_g)
-            for _, (_, indices) in group_tensors_by_shape(device_g).items():
-                # Chunk if batch_size is set
-                batches = (
-                    [
-                        indices[i : i + self.batch_size]
-                        for i in range(0, len(indices), self.batch_size)
-                    ]
-                    if self.batch_size and len(indices) > self.batch_size
-                    else [indices]
+                # Move to CUDA for processing (handles CPU offload)
+                cuda = torch.device("cuda")
+                batch_p = move_tensors_to_device(batch_p_orig, device, cuda)
+                batch_g = move_tensors_to_device(batch_g_orig, device, cuda)
+                batch_buf = move_tensors_to_device(batch_buf_orig, device, cuda)
+                batch_lr = move_tensors_to_device(batch_lr_orig, device, cuda)
+
+                _foreach_muon(
+                    cast(list[Tensor], batch_p),
+                    cast(list[Tensor], batch_g),
+                    cast(list[Tensor], batch_buf),
+                    cast(list[Tensor], batch_lr),
+                    nesterov,
+                    lr,
+                    weight_decay,
+                    cautious_wd,
+                    momentum,
+                    ns_steps,
+                    orthogonalization_strategy,
+                    maximize,
                 )
 
-                for batch_idx in batches:
-                    batch_p_orig = [device_p[i] for i in batch_idx]
-                    batch_g_orig = [device_g[i] for i in batch_idx]
-                    batch_buf_orig = [device_buf[i] for i in batch_idx]
-                    batch_lr_orig = [device_lr[i] for i in batch_idx]
-
-                    # Move to CUDA for processing (handles CPU offload)
-                    cuda = torch.device("cuda")
-                    batch_p = move_tensors_to_device(batch_p_orig, device, cuda)
-                    batch_g = move_tensors_to_device(batch_g_orig, device, cuda)
-                    batch_buf = move_tensors_to_device(batch_buf_orig, device, cuda)
-                    batch_lr = move_tensors_to_device(batch_lr_orig, device, cuda)
-
-                    _foreach_muon(
-                        cast(list[Tensor], batch_p),
-                        cast(list[Tensor], batch_g),
-                        cast(list[Tensor], batch_buf),
-                        cast(list[Tensor], batch_lr),
-                        nesterov,
-                        lr,
-                        weight_decay,
-                        cautious_wd,
-                        momentum,
-                        ns_steps,
-                        orthogonalization_strategy,
-                        maximize,
-                    )
-
-                    # CPU offload mutates CUDA copies; copy those values back to the
-                    # original tensors. Same-device batches alias and need no copy.
-                    for originals, moved in (
-                        (batch_p_orig, batch_p),
-                        (batch_g_orig, batch_g),
-                        (batch_buf_orig, batch_buf),
-                        (batch_lr_orig, batch_lr),
-                    ):
-                        if originals is not moved:
-                            for original, value in zip(originals, moved, strict=True):
-                                if original is not None and value is not None:
-                                    original.copy_(value.to(original.device))
+                # CPU offload mutates CUDA copies; copy those values back to the
+                # original tensors. Same-device batches alias and need no copy.
+                for originals, moved in (
+                    (batch_p_orig, batch_p),
+                    (batch_g_orig, batch_g),
+                    (batch_buf_orig, batch_buf),
+                    (batch_lr_orig, batch_lr),
+                ):
+                    if originals is not moved:
+                        for original, value in zip(originals, moved, strict=True):
+                            if original is not None and value is not None:
+                                original.copy_(value.to(original.device))
 
 
 def _foreach_muon(
