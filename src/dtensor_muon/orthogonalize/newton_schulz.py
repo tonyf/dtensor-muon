@@ -96,9 +96,11 @@ def ns_loop_triton(
         # B := B = b*A + c*A^2   (reuse B storage)
         B.mul_(c).add_(A, alpha=b)
 
-        # Keep this out-of-place so Inductor can use the contiguous layout
-        # required by the matmul template after the transpose path.
-        X = a * X + B @ X
+        # B is exactly symmetric because gram_ mirrors its output. In the
+        # transpose path, write B @ X as (X.mT @ B).mT so the matmul sees
+        # contiguous operands while X retains its transpose-friendly layout.
+        BX = (X.mT @ B).mT if transpose else B @ X
+        X = a * X + BX
 
     if transpose:
         X = X.mT
