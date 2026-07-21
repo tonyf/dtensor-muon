@@ -27,7 +27,10 @@ def get_dtensor_metadata(dtensors: DTensor | list[DTensor], run_check: bool = Tr
         "stride": tensor.stride(),
     }
 
-    if run_check and isinstance(dtensors, list):
+    # The consistency assert builds dicts of stride SymInts, which Dynamo cannot
+    # represent when this runs inside a compiled region under dynamic shapes —
+    # skip the purely defensive check there.
+    if run_check and isinstance(dtensors, list) and not torch.compiler.is_compiling():
         assert all(
             metadata
             == {
