@@ -1,8 +1,8 @@
 # dtensor-muon
 
-A distributed-ready implementation of the **Muon** optimizer built on PyTorch
+A distributed implementation of the **Muon** optimizer built on PyTorch
 [`DTensor`](https://docs.pytorch.org/docs/stable/distributed.tensor.html). It runs the
-orthogonalization step efficiently across sharded parameters (FSDP / tensor-parallel meshes).
+orthogonalization step across sharded parameters (FSDP / tensor-parallel meshes).
 
 Unlike the original distributed implementation, `dtensor-muon` has lower or zero communication overhead from collectives. For example, for expert-parallel MoEs, the optimizer can run orthogonalization directly over the local sharded parameters with no collectives.
 
@@ -10,73 +10,31 @@ This is an open-sourcing of work done at Dream3D. This was implemented without A
 
 ## What is Muon?
 
-Muon updates 2D+ parameters by taking the momentum-smoothed gradient and replacing it with
-its nearest semi-orthogonal matrix (the "zero-power" or matrix-sign of the gradient) before
-applying it. The orthogonalization is computed iteratively so it stays cheap on the GPU. This
-implementation provides two iteration schemes:
+Muon updates 2D+ parameters by replacing the momentum-smoothed gradient with its nearest
+semi-orthogonal matrix (the matrix-sign, or "zero power", of the gradient) before applying
+it. The orthogonalization is computed iteratively on the GPU, with two schemes available:
+classic Newton-Schulz iteration (backed by a fused Triton Gram-matrix kernel) and
+[Polar Express](https://arxiv.org/pdf/2505.16932), which uses precomputed coefficients for
+faster convergence. Learning rates are scaled by each matrix's shape
+(`sqrt(max(1, N/M))`) automatically.
 
-- **`newton_schulz`** — the classic Newton-Schulz iteration, with a fused Triton Gram-matrix
-  kernel.
-- **`polar_express`** — the Polar Express scheme ([arXiv:2505.16932](https://arxiv.org/pdf/2505.16932)),
-  which uses precomputed coefficients for faster convergence.
-
-## Features
-
-- **DTensor / distributed first** — orthogonalization is run across the device mesh, with a
-  dedicated fast path for parameters sharded only along dim 0 (FSDP).
-- **Unified Muon + Adam** — one optimizer handles both. Parameters Muon can't update (1D
-  tensors, embeddings, the LM head, etc.) are routed to a fused Adam/AdamW path via per-group
-  configuration.
-- **Three variants:**
-  - `Muon` — the reference per-parameter implementation.
-  - `MuonForeach` — batched `foreach` operations for higher throughput.
-  - `MuonLP` — Experimental quantized (4-bit / 8-bit / fp8) optimizer states via
-    [`torchao`](https://github.com/pytorch/ao) for reduced memory.
-- **Cautious weight decay** — an extension beyond the original Muon (which has no cautious
-  variant): weight decay is applied only where the update and parameter share a sign
-  (`u * p > 0`), following the Cautious Optimizers technique. On by default; set
-  `use_cautious_wd=False` for plain (non-cautious) decoupled weight decay.
-- **Nesterov momentum**, automatic shape-based learning-rate scaling, optional
-  `torch.compile`, and Triton kernels.
-
-## Requirements
-
-- Python ≥ 3.12
-- PyTorch ≥ 2.12.1
-- Triton (for the fused Newton-Schulz kernel)
-- `torchao` (optional, only for `MuonLP`)
+Muon only applies to weight matrices. A single `Muon` instance handles the remaining
+parameters (norms, biases, embeddings, the LM head) with PyTorch's fused Adam/AdamW,
+selected per param group.
 
 ## Installation
 
-
 ```bash
-# Install from PyPI
 uv pip install dtensor-muon
-
-# Install it directly from the repository:
-uv pip install git+https://github.com/tonyf/dtensor-muon.git
-
-# include torchao for the low-precision optimizer (MuonLP)
-uv pip install "dtensor-muon[lp] @ git+https://github.com/tonyf/dtensor-muon.git"
 ```
 
-### Development
-
-Clone the repository and sync the environment:
-
-```bash
-git clone https://github.com/tonyf/dtensor-muon.git
-cd dtensor-muon
-uv venv
-source .venv/bin/activate
-uv sync                  # core install
-uv sync --extra lp       # include torchao for the low-precision optimizer
-```
+Requires Python ≥ 3.12 and PyTorch ≥ 2.12.1. The `lp` extra (`dtensor-muon[lp]`) pulls in
+[`torchao`](https://github.com/pytorch/ao), needed only for `MuonLP`.
 
 ## Usage
 
-Muon is applied to 2D+ weight matrices, while norms, biases, and embeddings are typically
-left to Adam. Configure this with param groups using the `"algorithm"` key:
+Route weight matrices to Muon and everything else to Adam with the `"algorithm"` key on
+param groups:
 
 ```python
 import torch
@@ -96,7 +54,6 @@ optimizer = Muon(
     wd=0.1,
 )
 
-# standard training loop
 for batch in dataloader:
     loss = model(batch).loss
     loss.backward()
@@ -104,43 +61,33 @@ for batch in dataloader:
     optimizer.zero_grad()
 ```
 
-### Choosing a variant
+The update runs through one of two drivers, selected by the `foreach` flag (constructor
+default or per param group): the per-parameter reference loop, or a batched driver that
+groups params by (device, dtype, shape) and uses `torch._foreach_*` ops for higher
+throughput. The default (`None`) picks the batched driver automatically for groups whose
+params all live on CUDA; passing `foreach=True` explicitly also opts CPU-offloaded params
+into a per-batch CUDA round trip (`batch_size` caps how many tensors move at once).
 
-```python
-from dtensor_muon import Muon, MuonForeach, MuonLP   # MuonLP requires the `lp` extra
-```
+`MuonLP` (experimental, requires the `lp` extra) stores momentum in 4-bit, 8-bit, or fp8 to
+cut optimizer-state memory; it defaults to `foreach=False` because the quantized state
+subclasses don't support the batched ops.
 
-`MuonForeach` and `MuonLP` are drop-in replacements with the same constructor. Use
-`MuonForeach` for throughput and `MuonLP` to shrink optimizer-state memory.
+Weight decay is *cautious* by default — applied only where the update and the parameter
+agree in sign (`u * p > 0`), following the Cautious Optimizers technique. The original Muon
+has no cautious variant; set `use_cautious_wd=False` for plain decoupled weight decay.
 
-### Selecting an orthogonalization strategy
+The update kernels are compiled internally, so `optimizer.step()` needs no compile flag. It
+can also sit inside a surrounding `torch.compile(fullgraph=False)` region like any PyTorch
+optimizer; `fullgraph=True` through the step and differentiating through the update are not
+supported.
 
-```python
-optimizer = Muon(params, orthogonalization_strategy="polar_express")  # or "newton_schulz"
-```
-
-### Compiling the optimizer
-
-Muon compiles its update kernel automatically, so ordinary `optimizer.step()` calls do
-not need a compile flag. To include the complete optimizer update in a surrounding
-compiled region, wrap the step the same way as a PyTorch optimizer:
-
-```python
-@torch.compile(fullgraph=False)
-def compiled_optimizer_step():
-    optimizer.step()
-```
-
-The optimizer uses PyTorch's standard no-grad graph boundary around `step()`. Consequently,
-`fullgraph=True` and differentiating through the optimizer update are not supported.
-
-### Key options
+### Options
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `lr` | `1e-3` | Learning rate. |
 | `wd` | `0.1` | Weight decay. |
-| `use_cautious_wd` | `True` | Cautious weight decay — apply decay only where update and param share a sign (`u * p > 0`). An addition not present in the original Muon; set `False` for plain weight decay. |
+| `use_cautious_wd` | `True` | Apply decay only where update and param share a sign; `False` for plain decay. |
 | `momentum` | `0.95` | Muon momentum. |
 | `nesterov` | `True` | Use Nesterov momentum. |
 | `ns_steps` | `5` | Orthogonalization iteration steps. |
@@ -149,49 +96,116 @@ The optimizer uses PyTorch's standard no-grad graph boundary around `step()`. Co
 | `is_adamw` | `True` | Decoupled (AdamW) vs. coupled weight decay for the Adam path. |
 | `fused_adam` | `None` | Select the fused Adam kernel explicitly; `None` uses PyTorch's default dispatch. |
 | `foreach_adam` | `None` | Select the foreach Adam kernel explicitly; `None` uses PyTorch's default dispatch. |
+| `foreach` | `None` | Batched Muon driver. `None` = auto (on for all-CUDA groups); `True` also opts CPU-offloaded groups into the CUDA round trip. |
+| `batch_size` | `None` | Max tensors per foreach batch (`None` = unbounded). |
 
 Most options can also be overridden per param group.
 
-## Benchmarks
+Muon groups additionally accept `flatten` (default `False`): 3D+ tensors are treated as
+batches of 2D matrices, each orthogonalized independently (leading dims fold into the
+batch). This is what you want for stacked/FSDP-sharded weights — it is also what lets them
+take the sharded fast path (see Benchmarks). Set `flatten=True` — e.g. for convolutional
+weights — to collapse them to a single `(dim0, -1)` matrix instead.
 
-A self-contained benchmark suite lives in [`benchmark/`](benchmark/). Run the whole thing
-(kernels, single-device optimizers, and the distributed orthogonalization paths) with:
+### Algorithm variants
 
-```bash
-uv run python benchmark/run.py            # full run, writes benchmark/RESULTS.md
-uv run python benchmark/run.py --quick    # small shapes, fast smoke
+The `"algorithm"` key selects the update rule per param group. `"muon"` (default) and the
+`"adam"`/`"adamw"` fallback are built in, plus:
+
+| Algorithm | Extra group options | Description |
+| --- | --- | --- |
+| `"normuon"` | `muon_beta2` (`0.95`) | [NorMuon](https://arxiv.org/abs/2510.05491): normalizes the orthogonalized update by a per-neuron second-moment EMA, then rescales to preserve its Frobenius norm. Adds a `variance_neuron` state buffer (one value per row). |
+
+Variant-specific hyperparameters travel in the group dict, next to the `algorithm` key that
+selects them:
+
+```python
+optimizer = Muon(
+    [
+        {"params": hidden_weights},                                    # baseline muon
+        {"params": qkv_weights, "algorithm": "normuon", "muon_beta2": 0.95},
+        {"params": adam_params, "algorithm": "adamw"},
+    ]
+)
 ```
 
-Full numbers and methodology are in [`benchmark/RESULTS.md`](benchmark/RESULTS.md).
+Muon-family groups also accept `split_sizes` (2D params only): row blocks of a fused weight
+(e.g. a QKV projection, `split_sizes=(q_rows, k_rows, v_rows)`) are orthogonalized — and,
+for NorMuon, normalized — independently, matching the update separate per-block parameters
+would receive, while the model keeps the single wide GEMM.
 
-The snapshot below was measured on **2× NVIDIA RTX PRO 6000 Blackwell**, PyTorch 2.12.1+cu130.
+#### Registering your own variant
 
-**Distributed orthogonalization** (2× GPU, NCCL, params sharded on dim 0):
+Third-party packages can add algorithms without forking: subclass `MuonAlgorithm`,
+implement the per-tensor `update` (and optionally a batched `foreach_update` using
+`torch._foreach_*` ops — the default loops the per-tensor reference), and register it. The
+optimizer supplies everything around the math: state allocation from `state_spec`
+(including `MuonLP` quantization), batching, CPU offload, DTensor orthogonalization via the
+`orthogonalize_single` / `orthogonalize_batch` helpers, and `torch.compile`.
+
+```python
+from dtensor_muon import BufferSpec, MuonAlgorithm, register_muon_algorithm
+from dtensor_muon.optim.algorithms import orthogonalize_single
+
+
+@register_muon_algorithm
+class MyVariant(MuonAlgorithm):
+    name = "my_variant"
+    options = {"alpha": 0.5}  # per-group hyperparams and their defaults
+    state_spec = {
+        "momentum_buffer": BufferSpec(like="grad", signed=True),
+        # add extra per-param buffers here ("grad" or "grad_rows" shaped)
+    }
+
+    def update(self, param, grad, state, lr_ratio, *, lr, alpha, ns_steps,
+               orthogonalization_strategy, split_sizes, **kwargs):
+        buf = state["momentum_buffer"]
+        ...  # your math; call orthogonalize_single(g, ns_steps=..., strategy=..., split_sizes=...)
+
+
+optimizer = Muon([{"params": params, "algorithm": "my_variant", "alpha": 0.7}])
+```
+
+The `algorithm` name is stored in checkpoints, so `load_state_dict` restores the right
+variant (register it before loading).
+
+## Benchmarks
+
+The suite in [`benchmark/`](benchmark/) covers the kernels, single-device optimizers, and
+the distributed orthogonalization paths; `uv run python benchmark/run.py` writes results and
+methodology to [`benchmark/RESULTS.md`](benchmark/RESULTS.md) (`--quick` for a fast smoke
+run).
+
+Distributed orthogonalization, measured on 2× NVIDIA RTX PRO 6000 Blackwell
+(PyTorch 2.12.1+cu130, NCCL, params sharded on dim 0):
 
 | path | per-call (ms) | vs single-device |
 | --- | --- | --- |
 | single-device (replicated, no collectives) | 42.6 | 1.00× (ref) |
-| **FSDP fast path** (`foreach_zeropower_3d_fsdp`) | 20.4 | **2.09×** |
+| FSDP fast path (`foreach_zeropower_3d_fsdp`) | 20.4 | 2.09× |
 | general path (`foreach_zeropower` + redistribute) | 33.2 | 1.28× |
 
-The FSDP fast path works on each rank's local shard with no collectives — ~2.1× the
-single-device baseline (batch split across ranks) and ~1.6× faster than the general
-redistribute path. This is the core payoff of the DTensor design.
+The fast path applies when parameters are sharded only along dim 0 (the FSDP layout): each
+rank orthogonalizes its local shard with no collectives. The general path first
+redistributes the stacked batch across the mesh, which costs communication but still beats
+replicating.
 
-## Project layout
+## Development
+
+```bash
+git clone https://github.com/tonyf/dtensor-muon.git
+cd dtensor-muon
+uv sync --extra lp   # --extra lp is only needed for MuonLP/torchao
+
+uv run pytest        # test suite
+uv run ruff check    # lint
+uv run ty            # type check
+```
 
 ```
 src/dtensor_muon/
-├── optim/            # Muon, MuonForeach, MuonLP optimizers
+├── optim/            # Muon (+ MuonLP) optimizers and the algorithm registry
 ├── orthogonalize/    # zeropower dispatch, Newton-Schulz & Polar Express, DTensor handling
 ├── kernels/          # Triton Gram-matrix kernel
 └── utils/            # DTensor and foreach helpers
-```
-
-### Testing and linting
-
-```bash
-uv run pytest        # run the test suite
-uv run ruff check    # lint
-uv run ty            # type check
 ```

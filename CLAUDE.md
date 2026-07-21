@@ -32,37 +32,66 @@ they spawn a small **gloo** world on CPU and run anywhere.
 
 ## Architecture
 
-### Single optimizer, two algorithms dispatched by param group
+### Single optimizer, pluggable algorithms dispatched by param group
 
-`Muon` (`optim/optim.py`) is one `torch.optim.Optimizer` that drives both Muon and Adam. Each
-param-group dict carries an `"algorithm"` key (`"muon"` default, or `"adam"`/`"adamw"`).
+`Muon` (`optim/optim.py`) is one `torch.optim.Optimizer` that drives the whole Muon family plus
+Adam. Each param-group dict carries an `"algorithm"` key: `"adam"`/`"adamw"` take the special-cased
+Adam path (`_step_adam_group` → `torch.optim.adam.adam`, the upstream fused kernel); every other
+name is resolved through the **algorithm registry** in `optim/algorithms/` (`"muon"` is the
+default; `"normuon"` is built in; third parties add variants with `@register_muon_algorithm`).
 The constructor normalizes every group through `_build_muon_group` / `_build_adam_group`, which
 stamp a `use_muon` flag and resolve each option (lr, wd, momentum, …) with a per-group override
-falling back to the constructor default. `step()` then partitions `self.param_groups` by
-`use_muon` and routes each to `_step_muon_group` (→ `self.muon`) or `_step_adam_group`
-(→ `torch.optim.adam.adam`, the upstream fused kernel). `__setstate__` re-applies these defaults
-so checkpoints from older versions load.
+falling back to the constructor default; variant-specific options (declared in
+`MuonAlgorithm.options`, e.g. NorMuon's `muon_beta2`) live in the group dict only. `step()`
+partitions by `use_muon` and `_step_muon_group` looks up the group's algorithm, gathers state
+into `dict[str, list[Tensor]]` per the algorithm's `state_spec`, and calls a lazily-compiled
+per-algorithm kernel (`_muon_impls`, `torch.compile(partial(self.muon, algo), dynamic=True)`).
+`__setstate__` re-applies defaults (including `algorithm: "muon"` and each algorithm's option
+defaults) so checkpoints from older versions load; the algorithm *name string* is what persists
+in checkpoints.
 
-Muon only handles 2D+ real tensors; `_build_muon_group` raises on 1D or complex params. The
-intended usage is to route weight matrices to Muon and norms/biases/embeddings/LM-head to the
-Adam group.
+Muon only handles 2D+ real tensors; `MuonAlgorithm.validate_param` raises on 1D or complex
+params at group build. The intended usage is to route weight matrices to Muon and
+norms/biases/embeddings/LM-head to the Adam group. Muon groups may also set `split_sizes`
+(2D only, validated in `_validate_split_sizes`) to orthogonalize row blocks of a fused weight
+(e.g. QKV) independently, with per-block LR corrections (`split_lr_scales`).
 
-The base `muon()` method is the **per-parameter reference**: it runs the momentum buffer update,
-Nesterov mixing, `zeropower` orthogonalization, (cautious) weight decay, and shape-scaled LR — all
-in fp32 — for one tensor at a time. Subclasses override `muon()` (and sometimes
-`_init_muon_group`) to change *how* the update is batched/stored, reusing everything else.
+`flatten` (group option, default **False**, matching microsoft/dion) controls how 3D+ params
+are shaped before the update, in `_init_muon_group`: False treats them as batches of 2D
+matrices — leading dims fold into one batch dim (`grad.flatten(end_dim=-3)`), each trailing
+matrix orthogonalized independently, and `lr_ratio` comes from the matrix dims; True (opt-in,
+for conv-style weights) collapses to a single `(dim0, -1)` matrix. The False default is what
+lets 3D FSDP-stacked DTensors reach the `foreach_zeropower_3d_fsdp` fast path without extra
+configuration. State buffers are shaped like the *transformed* grad, so changing `flatten`
+for a param group is a state-breaking change.
 
-### Subclasses specialize, they don't fork
+### Two orthogonal axes: algorithms own the math, optimizer classes own execution
 
-- **`MuonForeach`** (`optim/optim_foreach.py`) overrides `muon()` to group tensors by
-  (device, dtype, shape) and drive the update with `torch._foreach_*` ops + the batched
-  `foreach_zeropower`. Handles CPU-offload by moving each batch to CUDA and back. Registers a
-  DTensor op-strategy for `_foreach_sign_` at import time.
-- **`MuonLP`** (`optim/optim_lp.py`, needs the `lp` extra) overrides `_init_muon_group` to store
-  the momentum buffer in a quantized torchao subclass. The concrete classes `Muon8bit`,
-  `Muon4bit`, `MuonFp8` only override `_subclass_zeros`. Buffers are quantized only when
-  `numel() >= 4096` and divisible by `block_size`; DTensor params get the quantized local tensor
-  re-wrapped via `DTensor.from_local`.
+`optim/algorithms/` holds `MuonAlgorithm` strategy objects: `name`, `options` (variant
+hyperparameter defaults), `state_spec` (declarative per-param buffers via `BufferSpec`,
+`like="grad"|"grad_rows"`), a per-tensor fp32 `update` reference, and an optional batched
+`foreach_update` (defaults to looping `update`). Algorithms never touch DTensor logic directly —
+they call `orthogonalize_single` / `orthogonalize_batch` from `algorithms/base.py`, which wrap
+`zeropower`/`foreach_zeropower`, pick the FSDP fast path, and implement the `split_sizes`
+row-block handling. `algorithms/base.py` is also the monkeypatch seam tests use to stub
+`zeropower`/`foreach_zeropower`.
+
+Execution strategy is per-group data too, not a class: `Muon.muon()` has two drivers selected
+by the group's `foreach` flag — the per-parameter reference loop (`algorithm.update` per
+tensor), or the batched shell (group by (device, dtype, shape), chunk by `batch_size`,
+move CPU-offloaded batches to CUDA and back, delegate to `algorithm.foreach_update`).
+`foreach=None` (default) resolves at group build to True iff every param is on CUDA;
+explicit `True` opts CPU(-offloaded) groups into the CUDA round trip and hence requires CUDA.
+The same group key drives the base Optimizer's foreach `zero_grad`, as in torch.optim.
+`optim.py` registers a DTensor op-strategy for `_foreach_sign_` at import time.
+
+- **`MuonLP`** (`optim/optim_lp.py`, needs the `lp` extra) overrides `_new_state_buffer` so any
+  algorithm's `like="grad"` buffers go through `_new_buffer` into a quantized torchao subclass
+  (`grad_rows` buffers are tiny and stay fp32). The concrete classes `Muon8bit`, `Muon4bit`,
+  `MuonFp8` only override `_subclass_zeros`. Buffers are quantized only when `numel() >= 4096`
+  and divisible by `block_size`; DTensor params get the quantized local tensor re-wrapped via
+  `DTensor.from_local`. Defaults `foreach=False`: the quantized subclasses don't implement the
+  `torch._foreach_*` ops.
 
 ### Orthogonalization is a dispatch layer over iteration schemes
 
@@ -89,8 +118,8 @@ DTensor handling also lives here and is the core distributed logic — there are
   orthogonalize local shards, redistribute and unbind back to per-param DTensors.
 - **FSDP fast path** (`foreach_zeropower_3d_fsdp`, guarded by `is_fsdp_3d_sharded`): for 3D
   DTensors sharded *only* on dim 0, it skips the redistribute and works directly on local shards —
-  the cheap path that makes sharded orthogonalization efficient. `MuonForeach.muon` checks
-  `is_fsdp_3d_sharded` and prefers this.
+  the cheap path that makes sharded orthogonalization efficient. `orthogonalize_batch`
+  (`optim/algorithms/base.py`) checks `is_fsdp_3d_sharded` and prefers this.
 
 ### Triton kernel
 

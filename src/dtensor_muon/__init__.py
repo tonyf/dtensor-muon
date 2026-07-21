@@ -1,12 +1,23 @@
 """dtensor-muon: a distributed-ready Muon optimizer built on PyTorch DTensor."""
 
-from .optim import Muon, MuonForeach
+from .optim import (
+    BufferSpec,
+    Muon,
+    MuonAlgorithm,
+    get_algorithm,
+    register_muon_algorithm,
+    registered_algorithms,
+)
 from .orthogonalize import OrthogonalizationStrategy
 
 __all__ = [
+    "BufferSpec",
     "Muon",
-    "MuonForeach",
+    "MuonAlgorithm",
     "OrthogonalizationStrategy",
+    "get_algorithm",
+    "register_muon_algorithm",
+    "registered_algorithms",
 ]
 
 try:

@@ -1,3 +1,4 @@
+import functools
 import math
 from typing import cast
 
@@ -10,7 +11,71 @@ from torch.optim.optimizer import (
     _use_grad_for_differentiable,
 )
 
-from dtensor_muon.orthogonalize import OrthogonalizationStrategy, zeropower
+from dtensor_muon.orthogonalize import OrthogonalizationStrategy
+from dtensor_muon.utils import group_tensors_by_shape, move_tensors_to_device
+
+from .algorithms import BufferSpec, MuonAlgorithm, get_algorithm
+from .algorithms.base import ADAM_ALGORITHMS
+
+
+def _register_dtensor_foreach_ops():
+    """Register _foreach_sign_ with DTensor using official register_op_strategy API."""
+    from torch.distributed.tensor._op_schema import (
+        OpSpec,
+        OpStrategy,
+        RuntimeSchemaInfo,
+        TupleStrategy,
+    )
+    from torch.distributed.tensor._ops.utils import register_op_strategy
+
+    op = torch.ops.aten._foreach_sign_.default
+    if hasattr(op, "_dtensor_registered"):
+        return
+
+    @register_op_strategy(op, schema_info=RuntimeSchemaInfo(needs_pytree=True))
+    def _(op_schema):
+        arg = op_schema.args_schema[0]
+        return TupleStrategy(
+            [
+                OpStrategy([OpSpec(s.output_specs, (s.output_specs,)) for s in c.strategies])
+                for c in arg.children
+            ]
+        )
+
+    setattr(op, "_dtensor_registered", True)
+
+
+_register_dtensor_foreach_ops()
+
+
+def _group_muon_tensors(
+    params: list[Tensor],
+    grads: list[Tensor],
+    state_lists: dict[str, list[Tensor]],
+    lr_ratios: list[Tensor],
+) -> list[
+    tuple[torch.device, list[Tensor], list[Tensor], dict[str, list[Tensor]], list[Tensor]]
+]:
+    """Build static homogeneous batches that are safe to stack during compilation."""
+    groups: dict[tuple[torch.device, torch.dtype], list[int]] = {}
+    for idx, param in enumerate(params):
+        groups.setdefault((param.device, param.dtype), []).append(idx)
+
+    homogeneous_groups = []
+    for (device, _), group_indices in groups.items():
+        group_grads = [grads[i] for i in group_indices]
+        for _, (_, shape_indices) in group_tensors_by_shape(group_grads).items():
+            indices = [group_indices[i] for i in shape_indices]
+            homogeneous_groups.append(
+                (
+                    device,
+                    [params[i] for i in indices],
+                    [grads[i] for i in indices],
+                    {key: [ts[i] for i in indices] for key, ts in state_lists.items()},
+                    [lr_ratios[i] for i in indices],
+                )
+            )
+    return homogeneous_groups
 
 
 class Muon(torch.optim.Optimizer):
@@ -33,6 +98,9 @@ class Muon(torch.optim.Optimizer):
         is_adamw: bool = True,
         fused_adam: bool | None = None,
         foreach_adam: bool | None = None,
+        # Execution strategy
+        foreach: bool | None = None,
+        batch_size: int | None = None,
     ):
         """
         Unified Muon + Adam optimizer.
@@ -42,6 +110,19 @@ class Muon(torch.optim.Optimizer):
                 Each param-group dict can have an optional "algorithm" key:
                 - "adamw" or "adam": Use Adam/AdamW for this group
                 - "muon" or omitted: Use Muon for this group (default)
+                - any registered Muon variant name (e.g. "normuon"); see
+                  ``dtensor_muon.register_muon_algorithm``. Variant-specific
+                  hyperparameters (e.g. NorMuon's ``muon_beta2``) are set in the
+                  group dict alongside ``algorithm``.
+                Muon-family groups may also set:
+                - ``flatten`` (default False): whether to flatten 3D+ tensors to
+                  2D for the Muon update. False treats them as batches of 2D
+                  matrices, each orthogonalized independently (leading dims fold
+                  into the batch); True collapses them to one ``(dim0, -1)``
+                  matrix — use this for convolutional layers.
+                - ``split_sizes`` (2D params only): orthogonalize row blocks of
+                  a fused weight (e.g. QKV) independently, as separate
+                  parameters would be.
             lr: Default learning rate
             wd: Default weight decay
             use_cautious_wd: Use cautious weight decay for Muon groups. When enabled,
@@ -61,6 +142,13 @@ class Muon(torch.optim.Optimizer):
             is_adamw: Use decoupled weight decay (AdamW) vs coupled (Adam)
             fused_adam: Use fused Adam kernel
             maximize: Maximize instead of minimize
+            foreach: Batch the Muon-family update with ``torch._foreach_*`` ops,
+                grouping params by (device, dtype, shape). ``None`` (default)
+                enables it per group when every param lives on CUDA. Explicit
+                ``True`` also opts CPU(-offloaded) groups into a CUDA round trip
+                per batch; requires CUDA. Overridable per param group (the group
+                key also controls foreach ``zero_grad``, as in torch.optim).
+            batch_size: Maximum tensors per foreach batch (None = unbounded).
         """
         self.lr = lr
         self.wd = wd
@@ -76,6 +164,8 @@ class Muon(torch.optim.Optimizer):
         self.fused_adam = fused_adam
         self.foreach_adam = foreach_adam
         self.maximize = maximize
+        self.foreach = foreach
+        self.batch_size = batch_size
 
         param_groups: list[dict] = []
 
@@ -110,35 +200,77 @@ class Muon(torch.optim.Optimizer):
             if len(group["params"]) == 0:
                 continue
 
-            if algorithm in ("adamw", "adam"):
+            if algorithm in ADAM_ALGORITHMS:
                 param_groups.append(self._build_adam_group(group))
-            elif algorithm == "muon":
-                param_groups.append(self._build_muon_group(group))
             else:
-                raise ValueError(
-                    f"Unknown algorithm '{algorithm}'. Must be 'muon', 'adam', or 'adamw'."
-                )
+                param_groups.append(self._build_muon_group(group, get_algorithm(algorithm)))
 
         super().__init__(param_groups, {"differentiable": False})
         self._init_muon_impl()
 
     def _init_muon_impl(self) -> None:
-        """Compile the overridable Muon kernel used by standalone optimizer steps."""
-        self._muon_impl = torch.compile(self.muon, dynamic=True)
+        """Reset the per-algorithm cache of compiled Muon kernels.
 
-    def _build_muon_group(self, group: dict):
-        if not all(p.ndim >= 2 for p in group["params"]):
+        Kernels are compiled lazily on first use (per algorithm name) so groups
+        added after construction — or loaded from checkpoints — get their own
+        compiled entry.
+        """
+        self._muon_impls: dict[str, object] = {}
+
+    def _raw_muon_impl(self, algorithm: MuonAlgorithm):
+        """The uncompiled update entry point with the algorithm bound."""
+        return functools.partial(self.muon, algorithm)
+
+    def _get_muon_impl(self, algorithm: MuonAlgorithm):
+        impl = self._muon_impls.get(algorithm.name)
+        if impl is None:
+            impl = torch.compile(self._raw_muon_impl(algorithm), dynamic=True)
+            self._muon_impls[algorithm.name] = impl
+        return impl
+
+    @staticmethod
+    def _validate_split_sizes(group: dict) -> tuple[int, ...] | None:
+        """Validate the optional ``split_sizes`` group option (2D fused weights)."""
+        split_sizes = group.get("split_sizes")
+        if split_sizes is None:
+            return None
+        if not isinstance(split_sizes, (tuple, list)) or len(split_sizes) < 2:
             raise ValueError(
-                "Muon only supports 2D+ parameters; found a 1D tensor in a Muon group"
+                f"split_sizes must be a tuple or list of at least 2 block sizes, "
+                f"got {split_sizes!r}."
             )
-
-        if any(torch.is_complex(p) for p in group["params"]):
-            raise NotImplementedError(
-                "Complex parameters are not supported in Muon. Add these parameters to the Adam group or use a different optimizer."
+        if not all(isinstance(s, int) and not isinstance(s, bool) and s > 0 for s in split_sizes):
+            raise ValueError(
+                f"split_sizes entries must be positive integers, got {split_sizes!r}."
             )
+        for p in group["params"]:
+            if p.ndim != 2:
+                raise ValueError(
+                    f"split_sizes is only supported for 2D parameters, got shape "
+                    f"{tuple(p.shape)}."
+                )
+            if sum(split_sizes) != p.shape[0]:
+                raise ValueError(
+                    f"split_sizes {tuple(split_sizes)} must sum to dim 0 of the "
+                    f"parameter shape {tuple(p.shape)}."
+                )
+        return tuple(split_sizes)
 
-        return {
+    def _build_muon_group(self, group: dict, algorithm: MuonAlgorithm):
+        for p in group["params"]:
+            algorithm.validate_param(p)
+
+        # Resolve the execution strategy to a concrete bool at build time. Auto
+        # (None) matches torch.optim: batch only when every param already lives
+        # on CUDA — explicit foreach=True opts CPU(-offloaded) params into the
+        # per-batch CUDA round trip.
+        foreach = group.get("foreach", self.foreach)
+        if foreach is None:
+            foreach = all(p.is_cuda for p in group["params"])
+
+        built = {
             "params": group["params"],
+            "algorithm": algorithm.name,
             "use_muon": True,
             "lr": torch.tensor(group.get("lr", self.lr)),
             "wd": group.get("wd", self.wd),
@@ -150,15 +282,23 @@ class Muon(torch.optim.Optimizer):
                 "orthogonalization_strategy", self.orthogonalization_strategy
             ),
             "maximize": group.get("maximize", self.maximize),
-            "flatten": group.get("flatten", True),
-            # Set to true for foreach zero_grad
-            "foreach": group.get("foreach", True),
+            "flatten": group.get("flatten", False),
+            "split_sizes": self._validate_split_sizes(group),
+            # Selects the batched foreach driver in muon(); also consumed by the
+            # base Optimizer's foreach zero_grad, as in torch.optim.
+            "foreach": foreach,
         }
+        # Variant-specific hyperparameters travel in the group dict; unset ones
+        # fall back to the algorithm's declared defaults.
+        for key, default in algorithm.options.items():
+            built[key] = group.get(key, default)
+        return built
 
     def _build_adam_group(self, group: dict):
         algorithm = cast(str, group.get("algorithm", "adamw")).lower()
         return {
             "params": group["params"],
+            "algorithm": algorithm,
             "use_muon": False,
             "lr": group.get("lr", self.lr),
             "wd": group.get("wd", self.wd),
@@ -180,11 +320,18 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             # Muon state initialization
             if group["use_muon"]:
+                group.setdefault("algorithm", "muon")
+                algorithm = get_algorithm(group["algorithm"])
                 group.setdefault("ns_steps", 5)
                 group.setdefault("nesterov", True)
-                group.setdefault("flatten", True)
+                group.setdefault("flatten", False)
                 group.setdefault("use_cautious_wd", True)
                 group.setdefault("orthogonalization_strategy", "polar_express")
+                group.setdefault("split_sizes", None)
+                if "foreach" not in group:
+                    group["foreach"] = all(p.is_cuda for p in group["params"])
+                for key, default in algorithm.options.items():
+                    group.setdefault(key, default)
                 if not torch.is_tensor(group["lr"]):
                     group["lr"] = torch.tensor(float(group["lr"]))
 
@@ -220,12 +367,21 @@ class Muon(torch.optim.Optimizer):
 
         self._init_muon_impl()
 
+    def _new_state_buffer(self, p: Tensor, grad: Tensor, spec: BufferSpec) -> Tensor:
+        """Allocate one per-parameter state buffer declared by an algorithm's
+        ``state_spec``. Overridden by low-precision optimizers to quantize."""
+        reference = grad if spec.like == "grad" else grad[..., :1]
+        return torch.zeros_like(
+            reference, dtype=torch.float32, memory_format=torch.preserve_format
+        )
+
     def _init_muon_group(
         self,
         group,
+        algorithm: MuonAlgorithm,
         params_with_grad: list[Tensor],
         grads: list[Tensor],
-        momentum_buffers: list[Tensor],
+        state_lists: dict[str, list[Tensor]],
         lr_ratios: list[Tensor],
         state_steps: list[Tensor],
     ) -> None:
@@ -237,10 +393,12 @@ class Muon(torch.optim.Optimizer):
             params_with_grad.append(p)
             assert not grad.is_sparse, "Muon does not support sparse gradients"
             if grad.ndim > 2:
-                assert grad.ndim == 3 or group["flatten"], (
-                    f"Got ndim={grad.ndim}. Please set flatten=True"
-                )
-                grad = grad.view(grad.size(0), -1) if group["flatten"] else grad
+                if group["flatten"]:
+                    # Opt-in (e.g. conv weights): collapse to a single 2D matrix.
+                    grad = grad.view(grad.size(0), -1)
+                elif grad.ndim > 3:
+                    # Batches of 2D matrices: fold leading dims into one batch dim.
+                    grad = grad.flatten(end_dim=-3)
 
             grads.append(grad)
             state = self.state[p]
@@ -248,15 +406,15 @@ class Muon(torch.optim.Optimizer):
             # Lazy state initialization
             if len(state) == 0:
                 state["step"] = torch.tensor(0.0, dtype=_get_scalar_dtype())
-                state["momentum_buffer"] = torch.zeros_like(
-                    grad, dtype=torch.float32, memory_format=torch.preserve_format
-                )
+                for key, spec in algorithm.state_spec.items():
+                    state[key] = self._new_state_buffer(p, grad, spec)
                 state["lr_ratio"] = torch.tensor(
                     math.sqrt(max(1.0, grad.shape[-2] / grad.shape[-1]))
                 )
 
             state["step"] += 1
-            momentum_buffers.append(state["momentum_buffer"])
+            for key in algorithm.state_spec:
+                state_lists[key].append(state[key])
             lr_ratios.append(state["lr_ratio"])
             state_steps.append(state["step"])
 
@@ -320,11 +478,13 @@ class Muon(torch.optim.Optimizer):
 
     def muon(
         self,
+        algorithm: MuonAlgorithm,
         params: list[Tensor],
         grads: list[Tensor],
-        momentum_buffers: list[Tensor],
+        state: dict[str, list[Tensor]],
         lr_ratios: list[Tensor],
         *,
+        foreach: bool = False,
         nesterov: bool,
         lr: Tensor,
         weight_decay: float,
@@ -333,66 +493,122 @@ class Muon(torch.optim.Optimizer):
         ns_steps: int,
         orthogonalization_strategy: OrthogonalizationStrategy,
         maximize: bool,
+        split_sizes: tuple[int, ...] | None = None,
+        **opts,
     ) -> None:
         """
-        Muon update for a list of parameters. Override in subclasses to customize.
+        Muon-family update for a list of parameters.
 
-        Handles device/dtype grouping, shape grouping, batching, and calls
-        the underlying foreach implementation.
+        Two drivers, selected by ``foreach``: the per-parameter reference loop
+        (``algorithm.update`` per tensor), or the batched shell — group tensors
+        by (device, dtype, shape), chunk by ``batch_size``, move CPU-offloaded
+        batches to CUDA and back — delegating to ``algorithm.foreach_update``.
+        The math itself lives on the :class:`MuonAlgorithm` either way.
         """
         if len(params) == 0:
             return
 
-        for param, grad, momentum_buffer, lr_ratio in zip(
-            params, grads, momentum_buffers, lr_ratios, strict=True
+        if not foreach:
+            for i, (param, grad, lr_ratio) in enumerate(
+                zip(params, grads, lr_ratios, strict=True)
+            ):
+                algorithm.update(
+                    param,
+                    grad,
+                    {key: buffers[i] for key, buffers in state.items()},
+                    lr_ratio,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    cautious_wd=cautious_wd,
+                    momentum=momentum,
+                    nesterov=nesterov,
+                    maximize=maximize,
+                    ns_steps=ns_steps,
+                    orthogonalization_strategy=orthogonalization_strategy,
+                    split_sizes=split_sizes,
+                    **opts,
+                )
+            return
+
+        for device, device_p, device_g, device_state, device_lr in _group_muon_tensors(
+            params, grads, state, lr_ratios
         ):
-            if maximize:
-                grad = -grad
+            indices = list(range(len(device_g)))
+            batches = (
+                [
+                    indices[i : i + self.batch_size]
+                    for i in range(0, len(indices), self.batch_size)
+                ]
+                if self.batch_size and len(indices) > self.batch_size
+                else [indices]
+            )
 
-            param_fp32 = param.to(torch.float32)
-            grad_fp32 = grad.to(torch.float32)
-            momentum_buffer_fp32 = momentum_buffer.to(torch.float32)
+            for batch_idx in batches:
+                batch_p_orig = [device_p[i] for i in batch_idx]
+                batch_g_orig = [device_g[i] for i in batch_idx]
+                batch_state_orig = {
+                    key: [ts[i] for i in batch_idx] for key, ts in device_state.items()
+                }
+                batch_lr_orig = [device_lr[i] for i in batch_idx]
 
-            # Keep the compiled math out-of-place until copying state back. This
-            # avoids functionalization aliasing the fp32 views with fp32 inputs.
-            momentum_buffer_fp32 = momentum_buffer_fp32 * momentum + grad_fp32
-            momentum_buffer.copy_(momentum_buffer_fp32)
+                # Move to CUDA for processing (handles CPU offload)
+                cuda = torch.device("cuda")
+                batch_p = move_tensors_to_device(batch_p_orig, device, cuda)
+                batch_g = move_tensors_to_device(batch_g_orig, device, cuda)
+                batch_state = {
+                    key: move_tensors_to_device(ts, device, cuda)
+                    for key, ts in batch_state_orig.items()
+                }
+                batch_lr = move_tensors_to_device(batch_lr_orig, device, cuda)
 
-            # Update gradient
-            if nesterov:
-                grad_fp32 = grad_fp32 + momentum_buffer_fp32 * momentum
-            else:
-                grad_fp32 = momentum_buffer_fp32
+                algorithm.foreach_update(
+                    cast(list[Tensor], batch_p),
+                    cast(list[Tensor], batch_g),
+                    cast(dict[str, list[Tensor]], batch_state),
+                    cast(list[Tensor], batch_lr),
+                    nesterov=nesterov,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    cautious_wd=cautious_wd,
+                    momentum=momentum,
+                    maximize=maximize,
+                    ns_steps=ns_steps,
+                    orthogonalization_strategy=orthogonalization_strategy,
+                    split_sizes=split_sizes,
+                    **opts,
+                )
 
-            # Zero power via orthogonalization (Newton-Schulz or Polar Express)
-            u = zeropower(grad_fp32, steps=ns_steps, strategy=orthogonalization_strategy)
-            u = u.view_as(param_fp32)
-
-            # Apply weight decay. Cautious WD (only where u * p > 0) is an addition
-            # to the original Muon; cautious_wd=False gives plain decoupled WD.
-            if weight_decay != 0:
-                if cautious_wd:
-                    u = u + weight_decay * param_fp32 * (u * param_fp32 > 0)
-                else:
-                    u = u + weight_decay * param_fp32
-
-            # Scale update
-            adjusted_lr = lr_ratio * lr
-            param.copy_(param_fp32 - adjusted_lr * u)
+                # CPU offload mutates CUDA copies; copy those values back to the
+                # original tensors. Same-device batches alias and need no copy.
+                moved_pairs = [
+                    (batch_p_orig, batch_p),
+                    (batch_g_orig, batch_g),
+                    (batch_lr_orig, batch_lr),
+                ]
+                moved_pairs.extend(
+                    (batch_state_orig[key], batch_state[key]) for key in batch_state_orig
+                )
+                for originals, moved in moved_pairs:
+                    if originals is not moved:
+                        for original, value in zip(originals, moved, strict=True):
+                            if original is not None and value is not None:
+                                original.copy_(value.to(original.device))
 
     def _step_muon_group(self, group: dict) -> None:
         """Process a single Muon param group."""
+        algorithm = get_algorithm(group.get("algorithm", "muon"))
         params_with_grad: list[Tensor] = []
         grads: list[Tensor] = []
         state_steps: list[Tensor] = []
-        momentum_buffers: list[Tensor] = []
+        state_lists: dict[str, list[Tensor]] = {key: [] for key in algorithm.state_spec}
         lr_ratios: list[Tensor] = []
 
         self._init_muon_group(
             group,
+            algorithm,
             params_with_grad,
             grads,
-            momentum_buffers,
+            state_lists,
             lr_ratios,
             state_steps,
         )
@@ -400,12 +616,17 @@ class Muon(torch.optim.Optimizer):
         # Standalone steps use the regional compiled kernel for performance. If an
         # outer torch.compile is tracing step(), use the raw method so the update is
         # captured in that optimizer graph instead of entering a nested compiler.
-        muon_impl = self.muon if torch.compiler.is_compiling() else self._muon_impl
+        muon_impl = (
+            self._raw_muon_impl(algorithm)
+            if torch.compiler.is_compiling()
+            else self._get_muon_impl(algorithm)
+        )
         muon_impl(
             params_with_grad,
             grads,
-            momentum_buffers,
+            state_lists,
             lr_ratios,
+            foreach=group["foreach"],
             nesterov=group["nesterov"],
             lr=group["lr"],
             weight_decay=group["wd"],
@@ -414,6 +635,8 @@ class Muon(torch.optim.Optimizer):
             ns_steps=group["ns_steps"],
             orthogonalization_strategy=group["orthogonalization_strategy"],
             maximize=group["maximize"],
+            split_sizes=group["split_sizes"],
+            **{key: group[key] for key in algorithm.options},
         )
 
     def _step_adam_group(self, group: dict) -> None:
@@ -474,8 +697,9 @@ class Muon(torch.optim.Optimizer):
     def step(self, closure=None):
         """Perform a single optimization step.
 
-        Parameter groups with ``use_muon=True`` use the Muon update; the remaining
-        groups use PyTorch's functional Adam/AdamW implementation.
+        Parameter groups with ``use_muon=True`` use their registered Muon-family
+        algorithm; the remaining groups use PyTorch's functional Adam/AdamW
+        implementation.
 
         Args:
             closure (Callable, optional): A closure that reevaluates the model and

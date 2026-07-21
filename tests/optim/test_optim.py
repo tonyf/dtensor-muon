@@ -4,7 +4,8 @@ from typing import Any
 import pytest
 import torch
 
-import dtensor_muon.optim.optim as optim_module
+import dtensor_muon.optim.algorithms.base as algo_base
+from dtensor_muon.optim.algorithms import get_algorithm
 from dtensor_muon.optim.optim import Muon
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -19,7 +20,7 @@ def test_standalone_step_uses_private_compiled_muon_callable():
     def compiled_muon(*args, **kwargs):
         calls.append((args, kwargs))
 
-    optimizer._muon_impl = compiled_muon
+    optimizer._muon_impls["muon"] = compiled_muon
     optimizer.step()
 
     assert len(calls) == 1
@@ -27,7 +28,7 @@ def test_standalone_step_uses_private_compiled_muon_callable():
 
 
 def test_external_torch_compile_captures_muon_update(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     p = torch.nn.Parameter(torch.ones(4, 2))
     ref = torch.nn.Parameter(p.detach().clone())
     optimizer = Muon(
@@ -38,7 +39,7 @@ def test_external_torch_compile_captures_muon_update(monkeypatch):
         nesterov=False,
     )
     ref_optimizer = Muon([ref], lr=0.1, wd=0.0, momentum=0.0, nesterov=False)
-    ref_optimizer._muon_impl = ref_optimizer.muon
+    ref_optimizer._muon_impls["muon"] = ref_optimizer._raw_muon_impl(get_algorithm("muon"))
     graphs = []
 
     def fail_nested_compile(*args, **kwargs):
@@ -48,7 +49,7 @@ def test_external_torch_compile_captures_muon_update(monkeypatch):
         graphs.append(graph_module)
         return graph_module.forward
 
-    optimizer._muon_impl = fail_nested_compile
+    optimizer._muon_impls["muon"] = fail_nested_compile
 
     @torch.compile(backend=recording_backend)
     def compiled_step():
@@ -151,7 +152,7 @@ def test_external_torch_compile_runs_real_muon_kernel_on_cuda(strategy):
     def fail_nested_compile(*args, **kwargs):
         raise AssertionError("external compilation must use the raw Muon kernel")
 
-    optimizer._muon_impl = fail_nested_compile
+    optimizer._muon_impls["muon"] = fail_nested_compile
 
     @torch.compile
     def compiled_step():
@@ -389,7 +390,7 @@ def test_step_returns_closure_loss():
 
 
 def test_muon_direct_update_initializes_state_and_uses_shape_lr_ratio(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     p = torch.nn.Parameter(torch.ones(4, 2))
     p.grad = torch.full_like(p, 0.5)
     optimizer = Muon([p], lr=0.1, wd=0.0, momentum=0.0, nesterov=False)
@@ -404,7 +405,7 @@ def test_muon_direct_update_initializes_state_and_uses_shape_lr_ratio(monkeypatc
 
 
 def test_muon_nesterov_uses_updated_momentum_buffer(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     p = torch.nn.Parameter(torch.ones(2, 2))
     p.grad = torch.full_like(p, 0.5)
     optimizer = Muon([p], lr=0.1, wd=0.0, momentum=0.5, nesterov=True)
@@ -417,7 +418,7 @@ def test_muon_nesterov_uses_updated_momentum_buffer(monkeypatch):
 
 
 def test_muon_cautious_weight_decay_masks_by_update_param_sign(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     p = torch.nn.Parameter(torch.tensor([[1.0, -1.0], [1.0, -1.0]]))
     p.grad = torch.tensor([[1.0, 1.0], [-1.0, -1.0]])
     optimizer = Muon(
@@ -435,7 +436,7 @@ def test_muon_cautious_weight_decay_masks_by_update_param_sign(monkeypatch):
 
 
 def test_muon_non_cautious_weight_decay_adds_param_everywhere(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     p = torch.nn.Parameter(torch.tensor([[1.0, -1.0], [1.0, -1.0]]))
     p.grad = torch.tensor([[1.0, 1.0], [-1.0, -1.0]])
     optimizer = Muon(
@@ -453,7 +454,7 @@ def test_muon_non_cautious_weight_decay_adds_param_everywhere(monkeypatch):
 
 
 def test_muon_maximize_negates_grad_in_place(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     p = torch.nn.Parameter(torch.ones(2, 2))
     grad = torch.full_like(p, 0.5)
     p.grad = grad
@@ -466,7 +467,7 @@ def test_muon_maximize_negates_grad_in_place(monkeypatch):
 
 
 def test_muon_maximize_reused_grad_keeps_maximize_direction(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     p = torch.nn.Parameter(torch.ones(2, 2))
     grad = torch.full_like(p, 0.5)
     p.grad = grad
@@ -482,7 +483,7 @@ def test_muon_maximize_reused_grad_keeps_maximize_direction(monkeypatch):
 
 
 def test_muon_momentum_buffer_uses_fp32_for_low_precision_params(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     p = torch.nn.Parameter(torch.ones(2, 2, dtype=torch.bfloat16))
     p.grad = torch.full_like(p, 0.5)
     optimizer = Muon([p], lr=0.1, wd=0.0, momentum=0.9, nesterov=False)
@@ -493,7 +494,7 @@ def test_muon_momentum_buffer_uses_fp32_for_low_precision_params(monkeypatch):
 
 
 def test_muon_skips_params_without_grad(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     with_grad = torch.nn.Parameter(torch.ones(2, 2))
     without_grad = torch.nn.Parameter(torch.ones(2, 2))
     with_grad.grad = torch.full_like(with_grad, 0.5)
@@ -513,7 +514,7 @@ def test_muon_flatten_true_updates_ndim_greater_than_three(monkeypatch):
         seen_shapes.append(tuple(g.shape))
         return g
 
-    monkeypatch.setattr(optim_module, "zeropower", fake_zeropower)
+    monkeypatch.setattr(algo_base, "zeropower", fake_zeropower)
     p = torch.nn.Parameter(torch.ones(2, 2, 2, 2))
     p.grad = torch.full_like(p, 0.5)
     optimizer = Muon([{"params": [p], "flatten": True}], lr=0.1, wd=0.0, momentum=0.0)
@@ -525,14 +526,44 @@ def test_muon_flatten_true_updates_ndim_greater_than_three(monkeypatch):
     torch.testing.assert_close(p, torch.ones_like(p) - 0.1 * 0.5)
 
 
-def test_muon_flatten_false_rejects_ndim_greater_than_three(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+def test_muon_flatten_false_batches_leading_dims_of_4d(monkeypatch):
+    seen_shapes = []
+
+    def fake_zeropower(g, **_):
+        seen_shapes.append(tuple(g.shape))
+        return g
+
+    monkeypatch.setattr(algo_base, "zeropower", fake_zeropower)
     p = torch.nn.Parameter(torch.ones(2, 2, 2, 2))
     p.grad = torch.full_like(p, 0.5)
-    optimizer = Muon([{"params": [p], "flatten": False}])
+    optimizer = Muon([{"params": [p], "flatten": False}], lr=0.1, wd=0.0, momentum=0.0)
 
-    with pytest.raises(AssertionError, match="Please set flatten=True"):
-        optimizer.step()
+    optimizer.step()
+
+    # Leading dims fold into one batch dim; each trailing 2x2 matrix is
+    # orthogonalized independently (dion semantics).
+    assert seen_shapes == [(4, 2, 2)]
+    assert torch.equal(optimizer.state[p]["lr_ratio"], torch.tensor(1.0))
+    torch.testing.assert_close(p, torch.ones_like(p) - 0.1 * 0.5)
+
+
+def test_muon_default_treats_3d_as_batch_of_matrices(monkeypatch):
+    seen_shapes = []
+
+    def fake_zeropower(g, **_):
+        seen_shapes.append(tuple(g.shape))
+        return g
+
+    monkeypatch.setattr(algo_base, "zeropower", fake_zeropower)
+    p = torch.nn.Parameter(torch.ones(2, 4, 2))
+    p.grad = torch.full_like(p, 0.5)
+    optimizer = Muon([p], lr=0.1, wd=0.0, momentum=0.0)
+
+    optimizer.step()
+
+    # flatten defaults to False: no reshape, lr_ratio from the matrix dims.
+    assert seen_shapes == [(2, 4, 2)]
+    assert torch.equal(optimizer.state[p]["lr_ratio"], torch.tensor(math.sqrt(2.0)))
 
 
 def test_muon_flatten_false_steps_3d_grad_without_flattening(monkeypatch):
@@ -542,7 +573,7 @@ def test_muon_flatten_false_steps_3d_grad_without_flattening(monkeypatch):
         seen_shapes.append(tuple(g.shape))
         return g
 
-    monkeypatch.setattr(optim_module, "zeropower", fake_zeropower)
+    monkeypatch.setattr(algo_base, "zeropower", fake_zeropower)
     p = torch.nn.Parameter(torch.ones(2, 2, 2))
     p.grad = torch.full_like(p, 0.5)
     optimizer = Muon([{"params": [p], "flatten": False}], lr=0.1, wd=0.0, momentum=0.0)
@@ -572,7 +603,7 @@ def test_load_state_dict_applies_legacy_defaults_and_tensor_steps():
 
     assert group["ns_steps"] == 5
     assert group["nesterov"] is True
-    assert group["flatten"] is True
+    assert group["flatten"] is False
     assert group["use_cautious_wd"] is True
     # Legacy default matches the constructor default ("polar_express"), so a
     # checkpoint missing the key doesn't silently switch the orthogonalization scheme.
@@ -601,7 +632,8 @@ def test_load_state_dict_applies_adam_legacy_defaults_and_step_tensor():
     assert torch.equal(optimizer.state[p]["step"], torch.tensor(4.0))
 
 
-def test_setstate_reinitializes_compiled_muon_impl(monkeypatch):
+def test_setstate_clears_compiled_muon_impl_cache_and_recompiles_lazily(monkeypatch):
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     compiled = []
 
     def fake_compile(fn, *, dynamic):
@@ -611,15 +643,22 @@ def test_setstate_reinitializes_compiled_muon_impl(monkeypatch):
     monkeypatch.setattr(torch, "compile", fake_compile)
     p = torch.nn.Parameter(torch.randn(2, 2))
     optimizer = Muon([p])
-    compiled.clear()
+    optimizer._muon_impls["muon"] = "stale-compiled-artifact"
 
     optimizer.__setstate__({"state": optimizer.state, "param_groups": optimizer.param_groups})
 
-    assert compiled == [(optimizer.muon, True)]
+    # A stale compiled kernel must not survive checkpoint load; the next step
+    # compiles a fresh per-algorithm entry.
+    assert optimizer._muon_impls == {}
+    p.grad = torch.full_like(p, 0.5)
+    optimizer.step()
+    assert len(compiled) == 1
+    assert compiled[0][1] is True
+    assert "muon" in optimizer._muon_impls
 
 
 def test_state_dict_round_trip_preserves_muon_training_continuity(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     p = torch.nn.Parameter(torch.ones(4, 2))
     uninterrupted_p = torch.nn.Parameter(p.detach().clone())
     loaded_p = torch.nn.Parameter(p.detach().clone())
@@ -648,7 +687,7 @@ def test_state_dict_round_trip_preserves_muon_training_continuity(monkeypatch):
 
 
 def test_mixed_muon_and_adam_groups_step_on_cpu(monkeypatch):
-    monkeypatch.setattr(optim_module, "zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "zeropower", lambda g, **_: g)
     muon_param = torch.nn.Parameter(torch.ones(2, 2))
     adam_param = torch.nn.Parameter(torch.randn(3))
     adam_ref = torch.nn.Parameter(adam_param.detach().clone())

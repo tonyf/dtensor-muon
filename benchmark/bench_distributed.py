@@ -6,7 +6,7 @@ update when parameters are sharded across ranks. We time three ways of doing it 
 FSDP layout):
 
 1. **FSDP fast path** — ``foreach_zeropower_3d_fsdp``: works directly on local shards,
-   no redistribute. This is what ``MuonForeach.muon`` prefers when ``is_fsdp_3d_sharded``.
+   no redistribute. This is what the foreach driver prefers when ``is_fsdp_3d_sharded``.
 2. **General path** — ``foreach_zeropower`` on the same sharded DTensors: stacks,
    redistributes to shard dim 0, orthogonalizes, redistributes back (collective-heavy).
 3. **Single-device baseline** — ``foreach_zeropower`` on the replicated full tensors

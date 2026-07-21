@@ -4,12 +4,9 @@ try:
 except ImportError:
     raise ImportError("Please install `torchao` package to use low-precision optimizers")
 
-import math
-
 import torch
 from torch import Tensor
 from torch.distributed.tensor import DTensor
-from torch.optim.optimizer import _get_scalar_dtype
 from torchao.optim.subclass_4bit import OptimState4bit  # ty: ignore[unresolved-import]
 from torchao.optim.subclass_8bit import OptimState8bit  # ty: ignore[unresolved-import]
 from torchao.optim.subclass_fp8 import OptimStateFp8  # ty: ignore[unresolved-import]
@@ -17,6 +14,7 @@ from torchao.optim.subclass_fp8 import OptimStateFp8  # ty: ignore[unresolved-im
 from dtensor_muon.orthogonalize import OrthogonalizationStrategy
 from dtensor_muon.utils import to_local
 
+from .algorithms import BufferSpec
 from .optim import Muon
 
 
@@ -42,6 +40,11 @@ class MuonLP(Muon):
         is_adamw: bool = True,
         foreach_adam: bool | None = None,
         fused_adam: bool | None = None,
+        # Execution strategy. Defaults to the per-param driver: the quantized
+        # torchao state subclasses do not implement the torch._foreach_* ops the
+        # batched driver uses.
+        foreach: bool | None = False,
+        batch_size: int | None = None,
         # Low-precision
         block_size: int = 2048,
         bf16_stochastic_round: bool = False,
@@ -64,6 +67,8 @@ class MuonLP(Muon):
             is_adamw=is_adamw,
             fused_adam=fused_adam,
             foreach_adam=foreach_adam,
+            foreach=foreach,
+            batch_size=batch_size,
         )
         self.block_size = block_size
         self.bf16_stochastic_round = bf16_stochastic_round
@@ -96,43 +101,18 @@ class MuonLP(Muon):
 
         return out.to(p.device)
 
-    def _init_muon_group(
-        self,
-        group,
-        params_with_grad: list[Tensor],
-        grads: list[Tensor],
-        momentum_buffers: list[Tensor],
-        lr_ratios: list[Tensor],
-        state_steps: list[Tensor],
-    ) -> None:
-        for p in group["params"]:
-            grad = p.grad
-            if grad is None:
-                continue
+    def _new_state_buffer(self, p: Tensor, grad: Tensor, spec: BufferSpec) -> Tensor:
+        """Allocate algorithm state through the quantizing ``_new_buffer`` path.
 
-            params_with_grad.append(p)
-            assert not grad.is_sparse, "Muon does not support sparse gradients"
-            if grad.ndim > 2:
-                assert grad.ndim == 3 or group["flatten"], (
-                    f"Got ndim={grad.ndim}. Please set flatten=True"
-                )
-                grad = grad.view(grad.size(0), -1) if group["flatten"] else grad
-
-            grads.append(grad)
-            state = self.state[p]
-
-            # Lazy state initialization with quantized buffers
-            if len(state) == 0:
-                state["step"] = torch.tensor(0.0, dtype=_get_scalar_dtype())
-                state["momentum_buffer"] = self._new_buffer(p, signed=True)
-                state["lr_ratio"] = torch.tensor(
-                    math.sqrt(max(1.0, grad.shape[-2] / grad.shape[-1]))
-                )
-
-            state["step"] += 1
-            momentum_buffers.append(state["momentum_buffer"])
-            lr_ratios.append(state["lr_ratio"])
-            state_steps.append(state["step"])
+        Grad-shaped buffers (e.g. the momentum buffer) are built from the
+        parameter via ``_new_buffer`` — quantized when eligible and re-wrapped as
+        DTensors. Row-shaped buffers (``like="grad_rows"``) are tiny (one value
+        per neuron), far below the quantization threshold, so they use the plain
+        fp32 allocation.
+        """
+        if spec.like == "grad":
+            return self._new_buffer(p, signed=spec.signed)
+        return super()._new_state_buffer(p, grad, spec)
 
 
 class Muon8bit(MuonLP):

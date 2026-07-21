@@ -1,9 +1,11 @@
-"""Equivalence tests for ``MuonForeach`` against the per-parameter ``Muon`` reference.
+"""Equivalence tests for the foreach driver against the per-parameter reference.
 
-``MuonForeach`` overrides only ``muon()`` to batch the update with ``torch._foreach_*``
-ops; every other piece (group building, state, Adam path) is inherited. So the
-batched update must produce the *same* parameter trajectory as the reference
-per-parameter loop in :class:`Muon` for the same config and inputs.
+The batched driver lives on ``Muon`` itself behind the per-group ``foreach``
+flag: the shell
+does device/shape grouping and CPU offload and delegates the math to the
+group's algorithm's ``foreach_update``. The batched update must produce the
+*same* parameter trajectory as the per-parameter reference loop
+(``foreach=False``) for the same config and inputs.
 
 This pins the weight-decay semantics in particular: the foreach path must apply
 ``weight_decay`` (with cautious masking) into the update direction exactly as the
@@ -23,9 +25,10 @@ from testkit import run_distributed
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
-import dtensor_muon.optim.optim_foreach as optim_foreach_module
+import dtensor_muon.optim.algorithms.base as algo_base
+import dtensor_muon.optim.optim as optim_module
+from dtensor_muon.optim.algorithms import get_algorithm
 from dtensor_muon.optim.optim import Muon
-from dtensor_muon.optim.optim_foreach import MuonForeach
 from dtensor_muon.orthogonalize import OrthogonalizationStrategy
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -71,20 +74,20 @@ def _make_params(shapes, device, seed=0):
 def test_foreach_batch_size_chunks_same_shape_group(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(
-        optim_foreach_module,
+        optim_module,
         "move_tensors_to_device",
         lambda tensors, _src, _dst: tensors,
     )
 
-    def fake_foreach_muon(p, g, buf, lr_ratio, *args, **kwargs):
+    def fake_foreach_update(p, g, state, lr_ratios, **kwargs):
         calls.append((len(p), [tuple(t.shape) for t in g]))
 
-    monkeypatch.setattr(optim_foreach_module, "_foreach_muon", fake_foreach_muon)
+    monkeypatch.setattr(get_algorithm("muon"), "foreach_update", fake_foreach_update)
     params = [nn.Parameter(torch.ones(2, 2)) for _ in range(5)]
     for p in params:
         p.grad = torch.full_like(p, 0.5)
 
-    MuonForeach(params, batch_size=2).step()
+    Muon(params, foreach=True, batch_size=2).step()
 
     assert calls == [
         (2, [(2, 2), (2, 2)]),
@@ -94,13 +97,13 @@ def test_foreach_batch_size_chunks_same_shape_group(monkeypatch) -> None:
 
 
 def test_foreach_step_with_all_none_grads_is_noop(monkeypatch) -> None:
-    def fail_foreach_muon(*args, **kwargs):
-        raise AssertionError("_foreach_muon should not be called")
+    def fail_foreach_update(*args, **kwargs):
+        raise AssertionError("foreach_update should not be called")
 
-    monkeypatch.setattr(optim_foreach_module, "_foreach_muon", fail_foreach_muon)
+    monkeypatch.setattr(get_algorithm("muon"), "foreach_update", fail_foreach_update)
     params = [nn.Parameter(torch.ones(2, 2)) for _ in range(2)]
     before = [p.detach().clone() for p in params]
-    optimizer = MuonForeach(params)
+    optimizer = Muon(params, foreach=True)
 
     optimizer.step()
 
@@ -112,21 +115,21 @@ def test_foreach_step_with_all_none_grads_is_noop(monkeypatch) -> None:
 def test_foreach_mixed_dtype_params_are_grouped_separately(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(
-        optim_foreach_module,
+        optim_module,
         "move_tensors_to_device",
         lambda tensors, _src, _dst: tensors,
     )
 
-    def fake_foreach_muon(p, g, buf, lr_ratio, *args, **kwargs):
-        calls.append((p[0].dtype, g[0].dtype, buf[0].dtype, len(p)))
+    def fake_foreach_update(p, g, state, lr_ratios, **kwargs):
+        calls.append((p[0].dtype, g[0].dtype, state["momentum_buffer"][0].dtype, len(p)))
 
-    monkeypatch.setattr(optim_foreach_module, "_foreach_muon", fake_foreach_muon)
+    monkeypatch.setattr(get_algorithm("muon"), "foreach_update", fake_foreach_update)
     fp32 = nn.Parameter(torch.ones(2, 2, dtype=torch.float32))
     bf16 = nn.Parameter(torch.ones(2, 2, dtype=torch.bfloat16))
     fp32.grad = torch.full_like(fp32, 0.5)
     bf16.grad = torch.full_like(bf16, 0.5)
 
-    MuonForeach([fp32, bf16]).step()
+    Muon([fp32, bf16], foreach=True).step()
 
     assert sorted(calls, key=lambda call: str(call[0])) == [
         (torch.bfloat16, torch.bfloat16, torch.float32, 1),
@@ -136,28 +139,29 @@ def test_foreach_mixed_dtype_params_are_grouped_separately(monkeypatch) -> None:
 
 def test_external_torch_compile_captures_heterogeneous_foreach_groups(monkeypatch) -> None:
     monkeypatch.setattr(
-        optim_foreach_module,
+        optim_module,
         "move_tensors_to_device",
         lambda tensors, _src, _dst: tensors,
     )
     kernel_groups = []
-    original_foreach_muon = optim_foreach_module._foreach_muon
+    baseline = get_algorithm("muon")
+    original_foreach_update = baseline.foreach_update
 
     def stack_identity(grads, **_kwargs):
         return list(torch.stack(grads).unbind())
 
-    def recording_foreach_muon(params, *args, **kwargs):
+    def recording_foreach_update(params, *args, **kwargs):
         kernel_groups.append((tuple(params[0].shape), params[0].dtype, len(params)))
-        return original_foreach_muon(params, *args, **kwargs)
+        return original_foreach_update(params, *args, **kwargs)
 
-    monkeypatch.setattr(optim_foreach_module, "foreach_zeropower", stack_identity)
-    monkeypatch.setattr(optim_foreach_module, "_foreach_muon", recording_foreach_muon)
+    monkeypatch.setattr(algo_base, "foreach_zeropower", stack_identity)
+    monkeypatch.setattr(baseline, "foreach_update", recording_foreach_update)
     params = [
         nn.Parameter(torch.ones(2, 2)),
         nn.Parameter(torch.ones(3, 2)),
         nn.Parameter(torch.ones(2, 2, dtype=torch.bfloat16)),
     ]
-    optimizer = MuonForeach(params, lr=0.1, wd=0.0, momentum=0.0, nesterov=False)
+    optimizer = Muon(params, foreach=True, lr=0.1, wd=0.0, momentum=0.0, nesterov=False)
     graphs = []
 
     def fail_nested_compile(*args, **kwargs):
@@ -167,7 +171,7 @@ def test_external_torch_compile_captures_heterogeneous_foreach_groups(monkeypatc
         graphs.append(graph_module)
         return graph_module.forward
 
-    optimizer._muon_impl = fail_nested_compile
+    optimizer._muon_impls["muon"] = fail_nested_compile
 
     @torch.compile(backend=recording_backend)
     def compiled_step():
@@ -193,8 +197,9 @@ def test_external_torch_compile_runs_real_foreach_kernel_on_cuda() -> None:
     before = [p.detach().clone() for p in params]
     for p in params:
         p.grad = torch.randn_like(p)
-    optimizer = MuonForeach(
+    optimizer = Muon(
         params,
+        foreach=True,
         lr=0.1,
         wd=0.0,
         momentum=0.0,
@@ -205,7 +210,7 @@ def test_external_torch_compile_runs_real_foreach_kernel_on_cuda() -> None:
     def fail_nested_compile(*args, **kwargs):
         raise AssertionError("external compilation must use the raw foreach kernel")
 
-    optimizer._muon_impl = fail_nested_compile
+    optimizer._muon_impls["muon"] = fail_nested_compile
 
     @torch.compile
     def compiled_step():
@@ -218,8 +223,8 @@ def test_external_torch_compile_runs_real_foreach_kernel_on_cuda() -> None:
 
 
 def test_register_dtensor_foreach_ops_is_idempotent() -> None:
-    optim_foreach_module._register_dtensor_foreach_ops()
-    optim_foreach_module._register_dtensor_foreach_ops()
+    optim_module._register_dtensor_foreach_ops()
+    optim_module._register_dtensor_foreach_ops()
 
     assert getattr(torch.ops.aten._foreach_sign_.default, "_dtensor_registered") is True
 
@@ -269,8 +274,8 @@ def test_foreach_matches_base_muon(
         use_cautious_wd=cautious,
         orthogonalization_strategy=strategy,
     )
-    ref = Muon(ref_params, **kwargs)
-    fe = MuonForeach(fe_params, **kwargs)
+    ref = Muon(ref_params, foreach=False, **kwargs)
+    fe = Muon(fe_params, foreach=True, **kwargs)
 
     grad_gen = torch.Generator(device=device).manual_seed(123)
     for _ in range(3):
@@ -292,14 +297,14 @@ def test_foreach_matches_base_muon(
             rtol=RTOL,
             atol=ATOL,
             max_mismatch_pct=MAX_MISMATCH_PCT,
-            msg=f"MuonForeach diverged from Muon for param {i} (shape {tuple(r.shape)})",
+            msg=f"foreach driver diverged from reference for param {i} (shape {tuple(r.shape)})",
         )
 
 
-# --- distributed: MuonForeach on DTensor parameters --------------------------------
+# --- distributed: the foreach driver on DTensor parameters -------------------------
 #
-# Spawns an nccl world (one rank per GPU) and runs a MuonForeach step on parameters
-# sharded across the mesh, checking the result matches a single-process MuonForeach
+# Spawns an nccl world (one rank per GPU) and runs a foreach-driver step on parameters
+# sharded across the mesh, checking the result matches a single-process foreach
 # step on the equivalent full tensors. This exercises the batched foreach DTensor
 # path (``foreach_zeropower`` with its ``redistribute``/``from_local`` round-trips).
 # GPU-only: the foreach path moves tensors to CUDA and orthogonalizes via Triton.
@@ -320,13 +325,13 @@ def _muon_foreach_dtensor_worker(rank: int, world_size: int) -> None:
     dparams = [nn.Parameter(distribute_tensor(f.clone(), mesh, [Shard(0)])) for f in fulls]
     for p, g in zip(dparams, grads, strict=True):
         p.grad = distribute_tensor(g.clone(), mesh, [Shard(0)])
-    MuonForeach(dparams, lr=0.1, wd=0.0).step()
+    Muon(dparams, foreach=True, lr=0.1, wd=0.0).step()
 
     # Reference: identical step on full tensors (runs the same on every rank).
     rparams = [nn.Parameter(f.clone()) for f in fulls]
     for p, g in zip(rparams, grads, strict=True):
         p.grad = g.clone()
-    MuonForeach(rparams, lr=0.1, wd=0.0).step()
+    Muon(rparams, foreach=True, lr=0.1, wd=0.0).step()
 
     for dp, rp in zip(dparams, rparams, strict=True):
         dparam = dp.data
@@ -344,22 +349,23 @@ def _muon_foreach_3d_fsdp_uses_fast_path_worker(rank: int, world_size: int) -> N
     mesh = init_device_mesh("cuda", (world_size,))
     torch.manual_seed(0)
     called_fast_path = False
-    original_fast_path = optim_foreach_module.foreach_zeropower_3d_fsdp
+    original_fast_path = algo_base.foreach_zeropower_3d_fsdp
 
     def recording_fast_path(*args, **kwargs):
         nonlocal called_fast_path
         called_fast_path = True
         return original_fast_path(*args, **kwargs)
 
-    cast(Any, optim_foreach_module).foreach_zeropower_3d_fsdp = recording_fast_path
+    cast(Any, algo_base).foreach_zeropower_3d_fsdp = recording_fast_path
     fulls = [torch.randn(4 * world_size, 16, 8, device="cuda") for _ in range(2)]
     grads = [torch.randn_like(f) for f in fulls]
     dparams = [nn.Parameter(distribute_tensor(f.clone(), mesh, [Shard(0)])) for f in fulls]
     for p, g in zip(dparams, grads, strict=True):
         p.grad = distribute_tensor(g.clone(), mesh, [Shard(0)])
 
-    MuonForeach(
+    Muon(
         [{"params": dparams, "flatten": False}],
+        foreach=True,
         lr=0.01,
         wd=0.0,
         orthogonalization_strategy="newton_schulz",
@@ -396,8 +402,8 @@ def test_foreach_cpu_offload_matches_cuda_step() -> None:
     cuda_param.grad = grad.clone().cuda()
 
     kwargs: dict[str, Any] = dict(lr=0.1, wd=0.0, orthogonalization_strategy="newton_schulz")
-    MuonForeach([cpu_param], **kwargs).step()
-    MuonForeach([cuda_param], **kwargs).step()
+    Muon([cpu_param], foreach=True, **kwargs).step()
+    Muon([cuda_param], foreach=True, **kwargs).step()
 
     assert cpu_param.device.type == "cpu"
     assert cpu_param.grad.device.type == "cpu"
@@ -412,11 +418,13 @@ def test_foreach_cpu_offload_matches_cuda_step() -> None:
 
 @requires_cuda
 def test_foreach_maximize_reused_grad_keeps_maximize_direction(monkeypatch) -> None:
-    monkeypatch.setattr(optim_foreach_module, "foreach_zeropower", lambda g, **_: g)
+    monkeypatch.setattr(algo_base, "foreach_zeropower", lambda g, **_: g)
     p = nn.Parameter(torch.ones(2, 2, device="cuda"))
     grad = torch.full_like(p, 0.5)
     p.grad = grad
-    optimizer = MuonForeach([p], lr=0.1, wd=0.0, momentum=0.0, nesterov=False, maximize=True)
+    optimizer = Muon(
+        [p], foreach=True, lr=0.1, wd=0.0, momentum=0.0, nesterov=False, maximize=True
+    )
 
     optimizer.step()
     after_first = p.detach().clone()

@@ -1,7 +1,20 @@
+from .algorithms import (
+    BufferSpec,
+    MuonAlgorithm,
+    get_algorithm,
+    register_muon_algorithm,
+    registered_algorithms,
+)
 from .optim import Muon
-from .optim_foreach import MuonForeach
 
-__all__ = ["Muon", "MuonForeach"]
+__all__ = [
+    "BufferSpec",
+    "Muon",
+    "MuonAlgorithm",
+    "get_algorithm",
+    "register_muon_algorithm",
+    "registered_algorithms",
+]
 
 try:
     import torchao  # noqa: F401  # ty: ignore[unresolved-import]

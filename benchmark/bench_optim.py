@@ -1,4 +1,4 @@
-"""Single-device optimizer benchmark: naive vs Muon vs MuonForeach vs MuonLP.
+"""Single-device optimizer benchmark: naive vs Muon (per-param and foreach drivers) vs MuonLP.
 
 Workload is a synthetic stack of transformer weight matrices (all Muon-eligible 2D+
 params). We time a full ``optimizer.step()`` — the whole update, including momentum,
@@ -6,7 +6,7 @@ orthogonalization, weight decay, and the param write — which is what actually 
 in training.
 
 All variants share hyperparameters (``ns_steps=5`` and ``use_cautious_wd=False`` to match
-the naive baseline). Muon kernels compile automatically. ``MuonForeach`` and ``MuonLP``
+the naive baseline). Muon kernels compile automatically. The foreach driver and ``MuonLP``
 move work to CUDA internally, so they only appear on a CUDA host. Before timing, the
 Newton-Schulz variants are sanity-checked against the naive reference from identical
 seeded params/grads.
@@ -67,17 +67,17 @@ def _step_fn(opt, params, grads):
 
 
 def _build_optimizer(kind, strategy, params):
-    from dtensor_muon.optim import Muon, MuonForeach
+    from dtensor_muon.optim import Muon
 
     if kind == "naive":
         return NaiveMuon(
             params, lr=_LR, wd=_WD, momentum=_MOMENTUM, nesterov=_NESTEROV, ns_steps=_NS_STEPS
         )
-    cls = {"Muon": Muon, "MuonForeach": MuonForeach}.get(kind)
-    if cls is None:
+    if kind not in ("Muon", "Muon-foreach"):
         raise ValueError(kind)
-    return cls(
+    return Muon(
         params,
+        foreach=kind == "Muon-foreach",
         lr=_LR,
         wd=_WD,
         momentum=_MOMENTUM,
@@ -97,8 +97,8 @@ def _variants(device):
     ]
     if device == "cuda":
         v += [
-            ("MuonForeach (ns)", "MuonForeach", "newton_schulz"),
-            ("MuonForeach (pe)", "MuonForeach", "polar_express"),
+            ("Muon-foreach (ns)", "Muon-foreach", "newton_schulz"),
+            ("Muon-foreach (pe)", "Muon-foreach", "polar_express"),
         ]
     # MuonLP's quantized subclasses (Muon8bit/Muon4bit/MuonFp8) are intentionally absent:
     # their torchao OptimStateNbit buffers don't implement the in-place mul_/add_ the
