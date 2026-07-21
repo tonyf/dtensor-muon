@@ -11,8 +11,8 @@ from torch.optim.optimizer import (
     _use_grad_for_differentiable,
 )
 
-from dtensor_muon.orthogonalize import OrthogonalizationStrategy
-from dtensor_muon.utils import group_tensors_by_shape, move_tensors_to_device
+from muonium.orthogonalize import OrthogonalizationStrategy
+from muonium.utils import group_tensors_by_shape, move_tensors_to_device
 
 from .algorithms import BufferSpec, MuonAlgorithm, get_algorithm
 from .algorithms.base import ADAM_ALGORITHMS
@@ -111,7 +111,7 @@ class Muon(torch.optim.Optimizer):
                 - "adamw" or "adam": Use Adam/AdamW for this group
                 - "muon" or omitted: Use Muon for this group (default)
                 - any registered Muon variant name (e.g. "normuon"); see
-                  ``dtensor_muon.register_muon_algorithm``. Variant-specific
+                  ``muonium.register_muon_algorithm``. Variant-specific
                   hyperparameters (e.g. NorMuon's ``muon_beta2``) are set in the
                   group dict alongside ``algorithm``.
                 Muon-family groups may also set:

@@ -6,7 +6,7 @@ import torch
 from testkit import run_example
 from torch import Tensor
 
-from dtensor_muon.kernels.gram import gram, gram_
+from muonium.kernels.gram import gram, gram_
 
 torch.manual_seed(42)
 torch.set_float32_matmul_precision("high")

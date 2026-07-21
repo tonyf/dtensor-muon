@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from dtensor_muon.utils.foreach import group_tensors_by_shape, move_tensors_to_device
+from muonium.utils.foreach import group_tensors_by_shape, move_tensors_to_device
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 requires_2_gpus = pytest.mark.skipif(

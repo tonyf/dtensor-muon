@@ -2,7 +2,7 @@
 import torch
 from torch import Tensor
 
-from dtensor_muon.orthogonalize import OrthogonalizationStrategy
+from muonium.orthogonalize import OrthogonalizationStrategy
 
 from .base import (
     BufferSpec,

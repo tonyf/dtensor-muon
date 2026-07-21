@@ -16,7 +16,7 @@ import pytest
 import torch
 from testkit import run_example
 
-from dtensor_muon.orthogonalize.newton_schulz import ns_loop, ns_loop_triton
+from muonium.orthogonalize.newton_schulz import ns_loop, ns_loop_triton
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 

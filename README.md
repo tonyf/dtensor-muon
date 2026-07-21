@@ -1,10 +1,25 @@
-# dtensor-muon
+# muonium
 
-A distributed implementation of the **Muon** optimizer built on PyTorch
-[`DTensor`](https://docs.pytorch.org/docs/stable/distributed.tensor.html). It runs the
-orthogonalization step across sharded parameters (FSDP / tensor-parallel meshes).
+A performant, distributed-ready implementation of the **Muon** optimizer — and a base for
+Muon research — built on PyTorch
+[`DTensor`](https://docs.pytorch.org/docs/stable/distributed.tensor.html).
+Formerly published as `dtensor-muon`.
 
-Unlike the original distributed implementation, `dtensor-muon` has lower or zero communication overhead from collectives. For example, for expert-parallel MoEs, the optimizer can run orthogonalization directly over the local sharded parameters with no collectives.
+- **Distributed by construction.** Orthogonalization runs across sharded parameters
+  (FSDP / tensor-parallel meshes), with a collective-free fast path when parameters are
+  sharded along dim 0 (the FSDP layout). For expert-parallel MoEs, orthogonalization runs
+  directly on the local sharded parameters with no collectives at all.
+- **A base for Muon variants.** The update rule is pluggable per param group: baseline
+  Muon and [NorMuon](https://arxiv.org/abs/2510.05491) are built in, and third parties
+  register their own variants with a few dozen lines — the optimizer supplies state
+  allocation, batching, CPU offload, DTensor handling, and `torch.compile` around your
+  math. Variant names persist in checkpoints.
+- **One optimizer for the whole model.** Weight matrices go to a Muon-family algorithm;
+  norms, biases, embeddings, and the LM head fall back to PyTorch's fused Adam/AdamW —
+  all selected per param group on a single optimizer instance.
+- **Performant.** Compiled update kernels, a batched `foreach` driver, a fused Triton
+  Gram-matrix kernel inside Newton-Schulz, and optional 4-bit/8-bit/fp8 optimizer state
+  (`MuonLP`).
 
 This is an open-sourcing of work done at Dream3D. This was implemented without AI tools originally. When copying the source over, Claude Fable 5 was used to audit the codebase, write tests and documentation, and fix a bug. Claude is tagged on all the commits he contributed to :)
 
@@ -25,10 +40,10 @@ selected per param group.
 ## Installation
 
 ```bash
-uv pip install dtensor-muon
+uv pip install muonium
 ```
 
-Requires Python ≥ 3.12 and PyTorch ≥ 2.12.1. The `lp` extra (`dtensor-muon[lp]`) pulls in
+Requires Python ≥ 3.12 and PyTorch ≥ 2.12.1. The `lp` extra (`muonium[lp]`) pulls in
 [`torchao`](https://github.com/pytorch/ao), needed only for `MuonLP`.
 
 ## Usage
@@ -38,7 +53,7 @@ param groups:
 
 ```python
 import torch
-from dtensor_muon import Muon
+from muonium import Muon
 
 model = ...
 
@@ -144,8 +159,8 @@ optimizer supplies everything around the math: state allocation from `state_spec
 `orthogonalize_single` / `orthogonalize_batch` helpers, and `torch.compile`.
 
 ```python
-from dtensor_muon import BufferSpec, MuonAlgorithm, register_muon_algorithm
-from dtensor_muon.optim.algorithms import orthogonalize_single
+from muonium import BufferSpec, MuonAlgorithm, register_muon_algorithm
+from muonium.optim.algorithms import orthogonalize_single
 
 
 @register_muon_algorithm
@@ -193,8 +208,8 @@ replicating.
 ## Development
 
 ```bash
-git clone https://github.com/tonyf/dtensor-muon.git
-cd dtensor-muon
+git clone https://github.com/tonyf/muonium.git
+cd muonium
 uv sync --extra lp   # --extra lp is only needed for MuonLP/torchao
 
 uv run pytest        # test suite
@@ -203,7 +218,7 @@ uv run ty            # type check
 ```
 
 ```
-src/dtensor_muon/
+src/muonium/
 ├── optim/            # Muon (+ MuonLP) optimizers and the algorithm registry
 ├── orthogonalize/    # zeropower dispatch, Newton-Schulz & Polar Express, DTensor handling
 ├── kernels/          # Triton Gram-matrix kernel

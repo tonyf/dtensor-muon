@@ -1,4 +1,4 @@
-"""dtensor-muon: a distributed-ready Muon optimizer built on PyTorch DTensor."""
+"""muonium: a distributed-ready Muon optimizer built on PyTorch DTensor."""
 
 from .optim import (
     BufferSpec,

@@ -35,8 +35,8 @@ try:
     from torchao.optim.subclass_8bit import OptimState8bit  # ty: ignore[unresolved-import]
     from torchao.optim.subclass_fp8 import OptimStateFp8  # ty: ignore[unresolved-import]
 
-    from dtensor_muon.optim import Muon, MuonLP
-    from dtensor_muon.optim.optim_lp import Muon4bit, Muon8bit, MuonFp8
+    from muonium.optim import Muon, MuonLP
+    from muonium.optim.optim_lp import Muon4bit, Muon8bit, MuonFp8
 except ImportError:
     TORCHAO_AVAILABLE = False
 else:

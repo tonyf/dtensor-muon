@@ -67,7 +67,7 @@ def _step_fn(opt, params, grads):
 
 
 def _build_optimizer(kind, strategy, params):
-    from dtensor_muon.optim import Muon
+    from muonium.optim import Muon
 
     if kind == "naive":
         return NaiveMuon(

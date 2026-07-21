@@ -16,15 +16,15 @@ from testkit import run_distributed
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
-import dtensor_muon.optim.algorithms.base as algo_base
-from dtensor_muon import (
+import muonium.optim.algorithms.base as algo_base
+from muonium import (
     Muon,
     MuonAlgorithm,
     get_algorithm,
     register_muon_algorithm,
     registered_algorithms,
 )
-from dtensor_muon.optim.algorithms import split_lr_scales
+from muonium.optim.algorithms import split_lr_scales
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 requires_2_gpus = pytest.mark.skipif(

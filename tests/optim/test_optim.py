@@ -4,9 +4,9 @@ from typing import Any
 import pytest
 import torch
 
-import dtensor_muon.optim.algorithms.base as algo_base
-from dtensor_muon.optim.algorithms import get_algorithm
-from dtensor_muon.optim.optim import Muon
+import muonium.optim.algorithms.base as algo_base
+from muonium.optim.algorithms import get_algorithm
+from muonium.optim.optim import Muon
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 

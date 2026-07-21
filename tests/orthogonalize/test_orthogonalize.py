@@ -13,15 +13,15 @@ import pytest
 import torch
 from testkit import assert_close, run_example
 
-from dtensor_muon.orthogonalize import OrthogonalizationStrategy
-from dtensor_muon.orthogonalize.newton_schulz import ns_loop, ns_loop_triton
-from dtensor_muon.orthogonalize.orthogonalize import (
+from muonium.orthogonalize import OrthogonalizationStrategy
+from muonium.orthogonalize.newton_schulz import ns_loop, ns_loop_triton
+from muonium.orthogonalize.orthogonalize import (
     _get_orthogonalization_fn,
     foreach_zeropower,
     is_fsdp_3d_sharded,
     zeropower,
 )
-from dtensor_muon.orthogonalize.polar_express import pe_loop, pe_loop_triton
+from muonium.orthogonalize.polar_express import pe_loop, pe_loop_triton
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 

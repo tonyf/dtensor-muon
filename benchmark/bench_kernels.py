@@ -33,7 +33,7 @@ def _quick(shapes):
 
 
 def _bench_gram(shapes, dtypes) -> str:
-    from dtensor_muon.kernels.gram import gram
+    from muonium.kernels.gram import gram
 
     rows = []
     for dtype in dtypes:
@@ -66,8 +66,8 @@ def _bench_gram(shapes, dtypes) -> str:
 
 
 def _bench_loops(shapes) -> str:
-    from dtensor_muon.orthogonalize.newton_schulz import ns_loop, ns_loop_triton
-    from dtensor_muon.orthogonalize.polar_express import pe_loop, pe_loop_triton
+    from muonium.orthogonalize.newton_schulz import ns_loop, ns_loop_triton
+    from muonium.orthogonalize.polar_express import pe_loop, pe_loop_triton
 
     # Three variants per strategy: uncompiled eager torch (the correctness reference,
     # reached via __wrapped__), the @torch.compile'd torch loop, and the @torch.compile'd

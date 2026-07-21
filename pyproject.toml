@@ -1,7 +1,7 @@
 [project]
-name = "dtensor-muon"
-version = "0.1.0"
-description = "DTensor-based Distributed Muon Optimizer"
+name = "muonium"
+version = "0.2.0"
+description = "A performant, distributed-ready base for Muon optimizer research, built on PyTorch DTensor"
 readme = "README.md"
 authors = [
     { name = "Tony Francis", email = "tonyfrancisv@gmail.com" }

@@ -25,11 +25,11 @@ from testkit import run_distributed
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
-import dtensor_muon.optim.algorithms.base as algo_base
-import dtensor_muon.optim.optim as optim_module
-from dtensor_muon.optim.algorithms import get_algorithm
-from dtensor_muon.optim.optim import Muon
-from dtensor_muon.orthogonalize import OrthogonalizationStrategy
+import muonium.optim.algorithms.base as algo_base
+import muonium.optim.optim as optim_module
+from muonium.optim.algorithms import get_algorithm
+from muonium.optim.optim import Muon
+from muonium.orthogonalize import OrthogonalizationStrategy
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 requires_2_gpus = pytest.mark.skipif(

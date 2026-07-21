@@ -15,7 +15,7 @@ import pytest
 import torch
 from testkit import run_example
 
-from dtensor_muon.orthogonalize.polar_express import (
+from muonium.orthogonalize.polar_express import (
     POLAR_EXPRESS_COEFFS,
     pe_loop,
     pe_loop_triton,

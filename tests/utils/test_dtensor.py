@@ -19,15 +19,15 @@ from testkit import assert_close, run_distributed
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
-from dtensor_muon.orthogonalize import OrthogonalizationStrategy
-from dtensor_muon.orthogonalize.orthogonalize import (
+from muonium.orthogonalize import OrthogonalizationStrategy
+from muonium.orthogonalize.orthogonalize import (
     foreach_zeropower,
     foreach_zeropower_3d_fsdp,
     get_dtensor_metadata,
     is_fsdp_3d_sharded,
     zeropower,
 )
-from dtensor_muon.utils.dtensor import to_local
+from muonium.utils.dtensor import to_local
 
 STEPS = 5
 # bfloat16 orthogonalization; distributed and reference run the identical kernel on

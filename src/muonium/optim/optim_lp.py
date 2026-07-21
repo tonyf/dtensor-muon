@@ -11,8 +11,8 @@ from torchao.optim.subclass_4bit import OptimState4bit  # ty: ignore[unresolved-
 from torchao.optim.subclass_8bit import OptimState8bit  # ty: ignore[unresolved-import]
 from torchao.optim.subclass_fp8 import OptimStateFp8  # ty: ignore[unresolved-import]
 
-from dtensor_muon.orthogonalize import OrthogonalizationStrategy
-from dtensor_muon.utils import to_local
+from muonium.orthogonalize import OrthogonalizationStrategy
+from muonium.utils import to_local
 
 from .algorithms import BufferSpec
 from .optim import Muon

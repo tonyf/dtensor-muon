@@ -1,4 +1,4 @@
-"""Benchmark suite for dtensor-muon.
+"""Benchmark suite for muonium.
 
 Run everything and regenerate ``benchmark/RESULTS.md``::
 

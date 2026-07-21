@@ -3,7 +3,7 @@
 This is what you'd write following Keller Jordan's original Muon: a plain
 ``torch.optim.Optimizer`` with a per-parameter Python loop, an eager 5-step
 Newton-Schulz orthogonalization in bf16, and no DTensor / Triton / ``torch.compile`` /
-fused-Adam machinery. The update math mirrors :meth:`dtensor_muon.optim.optim.Muon.muon`
+fused-Adam machinery. The update math mirrors :meth:`muonium.optim.optim.Muon.muon`
 (fp32 momentum buffer, Nesterov mixing, ``sqrt(max(1, rows/cols))`` shape-scaled LR) so
 the production variants can be benchmarked against it apples-to-apples.
 

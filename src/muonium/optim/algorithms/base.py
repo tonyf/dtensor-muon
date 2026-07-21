@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 from torch.distributed.tensor import DTensor, Replicate
 
-from dtensor_muon.orthogonalize import (
+from muonium.orthogonalize import (
     OrthogonalizationStrategy,
     foreach_zeropower,
     foreach_zeropower_3d_fsdp,

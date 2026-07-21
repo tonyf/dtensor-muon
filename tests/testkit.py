@@ -1,6 +1,6 @@
 """Shared test helpers (correctness/benchmark + distributed spawn).
 
-Test-only utilities, intentionally kept out of the shipped ``dtensor_muon``
+Test-only utilities, intentionally kept out of the shipped ``muonium``
 package. ``tests/conftest.py`` puts this directory on ``sys.path`` so tests import
 it by bare name::
 

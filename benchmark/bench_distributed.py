@@ -63,7 +63,7 @@ def _dist_bench_worker(
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import Shard, distribute_tensor
 
-    from dtensor_muon.orthogonalize import (
+    from muonium.orthogonalize import (
         foreach_zeropower,
         foreach_zeropower_3d_fsdp,
         is_fsdp_3d_sharded,

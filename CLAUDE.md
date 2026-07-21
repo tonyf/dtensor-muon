@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`dtensor-muon` is a distributed-ready implementation of the Muon optimizer built on PyTorch
+`muonium` is a distributed-ready implementation of the Muon optimizer built on PyTorch
 `DTensor`. It runs the orthogonalization (matrix-sign / "zero-power") step across sharded
 parameters (FSDP / tensor-parallel meshes) and falls back to fused Adam/AdamW for parameters
 Muon doesn't apply to — all from a single optimizer instance. See `README.md` for the user-facing

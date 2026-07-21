@@ -13,7 +13,7 @@ from typing import Annotated
 import torch
 from torch import Tensor
 
-from dtensor_muon.kernels.gram import gram_
+from muonium.kernels.gram import gram_
 
 # Polar Express coefficients from https://arxiv.org/pdf/2505.16932
 POLAR_EXPRESS_COEFFS = [
